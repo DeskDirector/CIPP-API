@@ -30,8 +30,11 @@ function Resolve-DnsHttpsQuery {
     )
 
     if (Test-Path -Path 'Config\DnsConfig.json') {
-        $Config = Get-Content 'Config\DnsConfig.json' | ConvertFrom-Json 
-        $Resolver = $Config.Resolver
+        try {
+            $Config = Get-Content 'Config\DnsConfig.json' | ConvertFrom-Json 
+            $Resolver = $Config.Resolver
+        }
+        catch { $Resolver = 'Google' }
     }
     else {
         $Resolver = 'Google'
@@ -46,6 +49,10 @@ function Resolve-DnsHttpsQuery {
             $BaseUri = 'https://cloudflare-dns.com/dns-query'
             $QueryTemplate = '{0}?name={1}&type={2}'
         }
+        'Quad9' {
+            $BaseUri = 'https://dns9.quad9.net:5053/dns-query'
+            $QueryTemplate = '{0}?name={1}&type={2}'
+        }
     }
 
     $Headers = @{
@@ -56,14 +63,38 @@ function Resolve-DnsHttpsQuery {
 
     Write-Verbose "### $Uri ###"
  
-    try {
-        $Results = Invoke-RestMethod -Uri $Uri -Headers $Headers -ErrorAction Stop
-    }
-    catch {
-        Write-Verbose "$Resolver DoH Query Exception - $($_.Exception.Message)" 
-        return $null
+    $Retry = 0
+    $DataReturned = $false
+    while (!$DataReturned) {
+        try {
+            $Results = Invoke-RestMethod -Uri $Uri -Headers $Headers -ErrorAction Stop
+        }
+        catch {
+            Write-Verbose "$Resolver DoH Query Exception - $($_.Exception.Message)" 
+        }
+    
+        if ($Resolver -eq 'Cloudflare' -or $Resolver -eq 'Quad9' -and $RecordType -eq 'txt' -and $Results.Answer) {
+            $Results.Answer | ForEach-Object {
+                $_.data = $_.data -replace '"' -replace '\s+', ' '
+            }
+        }
+
+        if ($Results.Answer) {
+            $DataReturned = $true
+        }
+        elseif ($Results.Status -ne 0) {
+            $DataReturned = $true
+        }
+        else {
+            if ($Retry -gt 3) {
+                $DataReturned = $true
+            }
+            $Retry++
+            Start-Sleep -Milliseconds 50
+        }
     }
     
+    Write-Verbose ($Results | ConvertTo-Json)
     return $Results
 }
 
@@ -82,7 +113,7 @@ function Test-DNSSEC {
     PS> Test-DNSSEC -Domain example.com
     
     Domain           : example.com
-    ValidationPasses : {PASS: example.com - DNSSEC enabled and validated}
+    ValidationPasses : {example.com - DNSSEC enabled and validated}
     ValidationFails  : {}
     Keys             : {...}
 
@@ -94,13 +125,13 @@ function Test-DNSSEC {
     )
     $DSResults = [PSCustomObject]@{
         Domain           = $Domain
-        ValidationPasses = New-Object System.Collections.Generic.List[string]
-        ValidationWarns  = New-Object System.Collections.Generic.List[string]
-        ValidationFails  = New-Object System.Collections.Generic.List[string]
-        Keys             = New-Object System.Collections.Generic.List[string]
+        ValidationPasses = [System.Collections.Generic.List[string]]::new()
+        ValidationWarns  = [System.Collections.Generic.List[string]]::new()
+        ValidationFails  = [System.Collections.Generic.List[string]]::new()
+        Keys             = [System.Collections.Generic.List[string]]::new()
     }
-    $ValidationPasses = New-Object System.Collections.Generic.List[string]
-    $ValidationFails = New-Object System.Collections.Generic.List[string]
+    $ValidationPasses = [System.Collections.Generic.List[string]]::new()
+    $ValidationFails = [System.Collections.Generic.List[string]]::new()
 
     $DnsQuery = @{
         RecordType = 'dnskey'
@@ -108,37 +139,95 @@ function Test-DNSSEC {
     }
 
     $Result = Resolve-DnsHttpsQuery @DnsQuery
-
-    $RecordCount = ($Result.Answer.data | Measure-Object).Count
-    if ($null -eq $Result) {
-        $ValidationFails.Add('FAIL: DNSSEC validation failed, no dnskey record found') | Out-Null
+    if ($Result.Status -eq 2 -and $Result.AD -eq $false) {
+        $ValidationFails.Add('DNSSEC Validation failed.') | Out-Null
     }
     else {
-        if ($Result.Status -eq 2) {
-            if ($Result.AD -eq $false) {
-                $ValidationFails.Add("FAIL: $($Result.Comment)") | Out-Null
-            }
-        }
-        elseif ($Result.Status -eq 3) {
-            $ValidationFails.Add('FAIL: Record does not exist (NXDOMAIN)') | Out-Null
-        }
-        elseif ($RecordCount -gt 0) {
-            if ($Result.AD -eq $false) {
-                $ValidationFails.Add('FAIL: DNSSEC enabled, but response was not validated. Ensure DNSSEC has been enabled at your registrar') | Out-Null
-            }
-            else {
-                $ValidationPasses.Add('PASS: DNSSEC enabled and validated for this domain') | Out-Null
-            }
-            $DSResults.Keys = $Result.answer.data
+        $RecordCount = ($Result.Answer.data | Measure-Object).Count
+        if ($null -eq $Result) {
+            $ValidationFails.Add('DNSSEC is not set up for this domain.') | Out-Null
         }
         else {
-            $ValidationFails.Add('FAIL: DNSSEC validation failed, no dnskey record found') | Out-Null
+            if ($Result.Status -eq 3) {
+                $ValidationFails.Add('DNSSEC is not set up for this domain.') | Out-Null
+            }
+            elseif ($RecordCount -gt 0) {
+                if ($Result.AD -eq $false) {
+                    $ValidationFails.Add('DNSSEC is enabled, but the DNS query response was not validated. Ensure DNSSEC has been enabled on your domain provider.') | Out-Null
+                }
+                else {
+                    $ValidationPasses.Add('DNSSEC is enabled and validated for this domain.') | Out-Null
+                }
+                $DSResults.Keys = $Result.answer.data
+            }
+            else {
+                $ValidationFails.Add('DNSSEC is not set up for this domain.') | Out-Null
+            }
         }
     }
 
     $DSResults.ValidationPasses = $ValidationPasses
     $DSResults.ValidationFails = $ValidationFails
     $DSResults
+}
+
+function Read-NSRecord {
+    <#
+    .SYNOPSIS
+    Reads NS records for domain
+    
+    .DESCRIPTION
+    Queries DNS servers to get NS records and returns in PSCustomObject list
+    
+    .PARAMETER Domain
+    Domain to query
+    
+    .EXAMPLE
+    PS> Read-NSRecord -Domain gmail.com
+    
+    #>
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true)]
+        [string]$Domain
+    )
+    $NSResults = [PSCustomObject]@{
+        Domain           = ''
+        Records          = [System.Collections.Generic.List[string]]::new()
+        ValidationPasses = [System.Collections.Generic.List[string]]::new()
+        ValidationWarns  = [System.Collections.Generic.List[string]]::new()
+        ValidationFails  = [System.Collections.Generic.List[string]]::new()
+        NameProvider     = ''
+    }
+    $ValidationPasses = [System.Collections.Generic.List[string]]::new()
+    $ValidationFails = [System.Collections.Generic.List[string]]::new()
+
+    $DnsQuery = @{
+        RecordType = 'ns'
+        Domain     = $Domain
+    }
+ 
+    $NSResults.Domain = $Domain
+
+    try {
+        $Result = Resolve-DnsHttpsQuery @DnsQuery
+    }
+    catch { $Result = $null }
+    if ($Result.Status -eq 2 -and $Result.AD -eq $false) {
+        $ValidationFails.Add('DNSSEC Validation failed.') | Out-Null
+    }
+    elseif ($Result.Status -ne 0 -or -not ($Result.Answer)) {
+        $ValidationFails.Add('No nameservers found for this domain.') | Out-Null
+        $NSRecords = $null
+    }
+    else {
+        $NSRecords = $Result.Answer.data
+        $ValidationPasses.Add('Nameserver record is present.') | Out-Null
+        $NSResults.Records = @($NSRecords)
+    }
+    $NSResults.ValidationPasses = $ValidationPasses
+    $NSResults.ValidationFails = $ValidationFails
+    $NSResults
 }
 
 function Read-MXRecord {
@@ -171,21 +260,23 @@ function Read-MXRecord {
     )
     $MXResults = [PSCustomObject]@{
         Domain           = ''
-        Records          = New-Object System.Collections.Generic.List[PSCustomObject]
-        ValidationPasses = New-Object System.Collections.Generic.List[string]
-        ValidationWarns  = New-Object System.Collections.Generic.List[string]
-        ValidationFails  = New-Object System.Collections.Generic.List[string]
+        Records          = [System.Collections.Generic.List[object]]::new()
+        ValidationPasses = [System.Collections.Generic.List[string]]::new()
+        ValidationWarns  = [System.Collections.Generic.List[string]]::new()
+        ValidationFails  = [System.Collections.Generic.List[string]]::new()
         MailProvider     = ''
         ExpectedInclude  = ''
         Selectors        = ''
     }
-    $ValidationPasses = New-Object System.Collections.Generic.List[string]
-    $ValidationFails = New-Object System.Collections.Generic.List[string]
+    $ValidationPasses = [System.Collections.Generic.List[string]]::new()
+    $ValidationFails = [System.Collections.Generic.List[string]]::new()
 
     $DnsQuery = @{
         RecordType = 'mx'
         Domain     = $Domain
     }
+
+    $NoMxValidation = 'There are no mail exchanger records for this domain. If you do not want to receive mail for this domain use a Null MX record of . with a priority 0 (RFC 7505).'
  
     $MXResults.Domain = $Domain
 
@@ -193,12 +284,19 @@ function Read-MXRecord {
         $Result = Resolve-DnsHttpsQuery @DnsQuery
     }
     catch { $Result = $null }
-    if ($null -eq $Result -or $Result.Status -ne 0) {
+    if ($Result.Status -eq 2 -and $Result.AD -eq $false) {
+        $ValidationFails.Add('DNSSEC validation failed.') | Out-Null
+    }
+    elseif ($Result.Status -ne 0 -or -not ($Result.Answer)) {
         if ($Result.Status -eq 3) {
-            $ValidationFails.Add('FAIL: Record does not exist (NXDOMAIN)') | Out-Null
+            $ValidationFails.Add($NoMxValidation) | Out-Null
+            $MXResults.MailProvider = Get-Content 'MailProviders\Null.json' | ConvertFrom-Json
+            $MXResults.Selectors = $MXRecords.MailProvider.Selectors
         }
         else {
-            $ValidationFails.Add("FAIL: $Domain - MX record does not exist") | Out-Null
+            $ValidationFails.Add($NoMxValidation) | Out-Null
+            $MXResults.MailProvider = Get-Content 'MailProviders\Null.json' | ConvertFrom-Json
+            $MXResults.Selectors = $MXRecords.MailProvider.Selectors
         }
         $MXRecords = $null
     }
@@ -213,7 +311,7 @@ function Read-MXRecord {
             }
             catch {}
         }
-        $ValidationPasses.Add("PASS: $Domain - MX record is present") | Out-Null
+        $ValidationPasses.Add('Mail exchanger records record(s) are present for this domain.') | Out-Null
         $MXRecords = $MXRecords | Sort-Object -Property Priority
 
         # Attempt to identify mail provider based on MX record
@@ -221,44 +319,49 @@ function Read-MXRecord {
             $ReservedVariables = @{
                 'DomainNameDashNotation' = $Domain -replace '\.', '-'
             }
-
-            Get-ChildItem 'MailProviders' -Exclude '_template.json' | ForEach-Object {
-                try {
-                    $Provider = Get-Content $_ | ConvertFrom-Json -ErrorAction Stop
-                    $MXRecords.Hostname | ForEach-Object {
-                        if ($_ -match $Provider.MxMatch) {
-                            $MXResults.MailProvider = $Provider
-                            if (($Provider.SpfReplace | Measure-Object | Select-Object -ExpandProperty Count) -gt 0) {
-                                $ReplaceList = New-Object System.Collections.Generic.List[string]
-                                foreach ($Var in $Provider.SpfReplace) { 
-                                    if ($ReservedVariables.Keys -contains $Var) {
-                                        $ReplaceList.Add($ReservedVariables.$Var) | Out-Null
-                                    } 
-                                    else {
-                                        $ReplaceList.Add($Matches.$Var) | Out-Null
+            if ($MXRecords.Hostname -eq '') {
+                $ValidationFails.Add($NoMxValidation) | Out-Null
+                $MXResults.MailProvider = Get-Content 'MailProviders\Null.json' | ConvertFrom-Json
+            }
+            else {
+                Get-ChildItem 'MailProviders' -Exclude '_template.json' | ForEach-Object {
+                    try {
+                        $Provider = Get-Content $_ | ConvertFrom-Json -ErrorAction Stop
+                        $MXRecords.Hostname | ForEach-Object {
+                            if ($_ -match $Provider.MxMatch) {
+                                $MXResults.MailProvider = $Provider
+                                if (($Provider.SpfReplace | Measure-Object | Select-Object -ExpandProperty Count) -gt 0) {
+                                    $ReplaceList = [System.Collections.Generic.List[string]]::new()
+                                    foreach ($Var in $Provider.SpfReplace) { 
+                                        if ($ReservedVariables.Keys -contains $Var) {
+                                            $ReplaceList.Add($ReservedVariables.$Var) | Out-Null
+                                        } 
+                                        else {
+                                            $ReplaceList.Add($Matches.$Var) | Out-Null
+                                        }
                                     }
+
+                                    $ExpectedInclude = $Provider.SpfInclude -f ($ReplaceList -join ', ')
+                                }
+                                else {
+                                    $ExpectedInclude = $Provider.SpfInclude
                                 }
 
-                                $ExpectedInclude = $Provider.SpfInclude -f ($ReplaceList -join ',')
+                                # Set ExpectedInclude and Selector fields based on provider details
+                                $MXResults.ExpectedInclude = $ExpectedInclude
+                                $MXResults.Selectors = $Provider.Selectors
                             }
-                            else {
-                                $ExpectedInclude = $Provider.SpfInclude
-                            }
-                            # Set ExpectedInclude and Selector fields based on provider details
-                            $MXResults.ExpectedInclude = $ExpectedInclude
-                            $MXResults.Selectors = $Provider.Selectors
                         }
                     }
-                }
-                catch {
-                    Write-Host "MailProvider - Error parsing json from $_"
+                    catch {}
                 }
             }
         }
         $MXResults.Records = $MXRecords
     }
-    $MXResults.ValidationPasses = $ValidationPasses
-    $MXResults.ValidationFails = $ValidationFails
+    $MXResults.ValidationPasses = @($ValidationPasses)
+    $MXResults.ValidationFails = @($ValidationFails)
+    $MXResults.Records = @($MXResults.Records)
     $MXResults
 }
 
@@ -282,9 +385,9 @@ function Read-SpfRecord {
     RecordCount      : 1
     LookupCount      : 4
     AllMechanism     : ~
-    ValidationPasses : {PASS: Expected SPF record was included, PASS: No PermError detected in SPF record}
+    ValidationPasses : {Expected SPF record was included, No PermError detected in SPF record}
     ValidationWarns  : {}
-    ValidationFails  : {FAIL: SPF record should end in -all to prevent spamming}
+    ValidationFails  : {SPF record should end in -all to prevent spamming}
     RecordList       : {@{Domain=_spf.google.com; Record=v=spf1 include:_netblocks.google.com include:_netblocks2.google.com include:_netblocks3.google.com ~all;           RecordCount=1; LookupCount=4; AllMechanism=~; ValidationPasses=System.Collections.ArrayList; ValidationWarns=System.Collections.ArrayList; ValidationFails=System.Collections.ArrayList; RecordList=System.Collections.ArrayList; TypeLookups=System.Collections.ArrayList; IPAddresses=System.Collections.ArrayList; PermError=False}}
     TypeLookups      : {}
     IPAddresses      : {}
@@ -310,38 +413,47 @@ function Read-SpfRecord {
         [Parameter(ParameterSetName = 'Manual')]
         [string]$ExpectedInclude = ''
     )
-    $SPFResults = [PSCustomObject]@{
-        Domain           = ''
-        Record           = ''
-        RecordCount      = 0
-        LookupCount      = 0
-        AllMechanism     = ''
-        ValidationPasses = New-Object System.Collections.Generic.List[string]
-        ValidationWarns  = New-Object System.Collections.Generic.List[string]
-        ValidationFails  = New-Object System.Collections.Generic.List[string]
-        RecordList       = New-Object System.Collections.Generic.List[PSCustomObject]   
-        TypeLookups      = New-Object System.Collections.Generic.List[PSCustomObject]
-        IPAddresses      = New-Object System.Collections.Generic.List[string]
-        MailProvider     = ''
-        Status           = ''
+    $SpfResults = [PSCustomObject]@{
+        Domain            = ''
+        Record            = ''
+        RecordCount       = 0
+        LookupCount       = 0
+        AllMechanism      = ''
+        ValidationPasses  = [System.Collections.Generic.List[string]]::new()
+        ValidationWarns   = [System.Collections.Generic.List[string]]::new()
+        ValidationFails   = [System.Collections.Generic.List[string]]::new()
+        RecordList        = [System.Collections.Generic.List[object]]::new()   
+        TypeLookups       = [System.Collections.Generic.List[object]]::new()
+        Recommendations   = [System.Collections.Generic.List[object]]::new()
+        RecommendedRecord = ''
+        IPAddresses       = [System.Collections.Generic.List[string]]::new()
+        MailProvider      = ''
+        Status            = ''
+
     }
 
+  
+
     # Initialize lists to hold all records
-    $RecordList = New-Object System.Collections.Generic.List[PSCustomObject]
-    $ValidationFails = New-Object System.Collections.Generic.List[string]
-    $ValidationPasses = New-Object System.Collections.Generic.List[string]
-    $ValidationWarns = New-Object System.Collections.Generic.List[string]
+    $RecordList = [System.Collections.Generic.List[object]]::new()
+    $ValidationFails = [System.Collections.Generic.List[string]]::new()
+    $ValidationPasses = [System.Collections.Generic.List[string]]::new()
+    $ValidationWarns = [System.Collections.Generic.List[string]]::new()
+    $Recommendations = [System.Collections.Generic.List[object]]::new()
     $LookupCount = 0
     $AllMechanism = ''
     $Status = ''
+    $RecommendedRecord = ''
 
-    $TypeLookups = New-Object System.Collections.Generic.List[PSCustomObject]
-    $IPAddresses = New-Object System.Collections.Generic.List[string]
+    $TypeLookups = [System.Collections.Generic.List[object]]::new()
+    $IPAddresses = [System.Collections.Generic.List[string]]::new()
        
     $DnsQuery = @{
         RecordType = 'TXT'
         Domain     = $Domain
     }
+
+    $NoSpfValidation = 'No SPF record was detected for this domain.'
 
     # Query DNS for SPF Record
     try {
@@ -352,22 +464,38 @@ function Read-SpfRecord {
                 }
                 else {
                     $Query = Resolve-DnsHttpsQuery @DnsQuery
-                    if ($null -ne $Query -and $Query.Status -ne 0) {
+                    if ($Query.Status -eq 2 -and $Query.AD -eq $false) {
+                        $ValidationFails.Add('DNSSEC validation failed.') | Out-Null
+                    }
+                    elseif ($Query.Status -ne 0) {
                         if ($Query.Status -eq 3) {
-                            $ValidationFails.Add("FAIL: $Domain - Record does not exist, nxdomain") | Out-Null
+                            $ValidationFails.Add($NoSpfValidation) | Out-Null
                             $Status = 'permerror'
                         }
                         else {
-                            $ValidationFails.Add("FAIL: $Domain - Does not resolve an SPF record.") | Out-Null
+                            Write-Host $Query
+                            $ValidationFails.Add($NoSpfValidation) | Out-Null
                             $Status = 'temperror'
                         }
                     }
                     else {
-                        $Record = $Query.answer | Select-Object -ExpandProperty data | Where-Object { $_ -match '^v=spf1' }
-                        $RecordCount = ($Record | Measure-Object).Count
+                        
+                        $Answer = ($Query.answer | Where-Object { $_.data -match '^v=spf1' })
+                        $RecordCount = ($Answer.data | Measure-Object).count
+                        $Record = $Answer.data
                         if ($RecordCount -eq 0) { 
-                            $ValidationFails.Add("FAIL: $Domain does not resolve an SPF record.") | Out-Null
+                            $ValidationFails.Add($NoSpfValidation) | Out-Null
                             $Status = 'permerror'
+                        }
+                        # Check for the correct number of records
+                        elseif ($RecordCount -gt 1 -and $Level -eq 'Parent') {
+                            $ValidationFails.Add("There must only be one SPF record per domain, we found $RecordCount.") | Out-Null 
+                            $Recommendations.Add([pscustomobject]@{
+                                    Message = 'Delete one of the records beginning with v=spf1'
+                                    Match   = '' 
+                                }) | Out-Null
+                            $Status = 'permerror'
+                            $Record = $Answer.data[0]
                         }
                     }
                 }
@@ -377,47 +505,63 @@ function Read-SpfRecord {
                 $RecordCount = 1
             }
         }
-        $SPFResults.Domain = $Domain
+        $SpfResults.Domain = $Domain
 
         if ($Record -ne '' -and $RecordCount -gt 0) {
             # Split records and parse
-            if ($Record -match '^v=spf1\s+(?<Terms>.+?)(:?\s+(?<AllMechanism>[+-~?]all)(:?\s+(?<Discard>(?!all).+))?)?$') {
-                $RecordTerms = $Matches.Terms -split '\s+'
-                Write-Verbose "########### Record: $Record"
+            if ($Record -match '^v=spf1(:?\s+(?<Terms>(?![+-~?]all).+?))?(:?\s+(?<AllMechanism>[+-~?]all)(:?\s+(?<Discard>(?!all).+))?)?$') {
+                if ($Matches.Terms) {
+                    $RecordTerms = $Matches.Terms -split '\s+'
+                }
+                else {
+                    $RecordTerms = @()
+                }
+                Write-Verbose "########### RECORD: $Record"
 
                 if ($Level -eq 'Parent' -or $Level -eq 'Redirect') {
                     $AllMechanism = $Matches.AllMechanism
                 }
 
                 if ($null -ne $Matches.Discard) {
-                    $ValidationWarns.Add("WARN: The terms '$($Matches.Discard)' are past the all mechanism and will be discarded") | Out-Null
+                    if ($Matches.Discard -notmatch '^exp=(?<Domain>.+)$') {
+                        $ValidationWarns.Add("The terms '$($Matches.Discard)' are past the all mechanism and will be discarded.") | Out-Null
+                        $Recommendations.Add([pscustomobject]@{
+                                Message = 'Remove entries following all';
+                                Match   = $Matches.Discard
+                                Replace = ''
+                            }) | Out-Null
+                    }
                 }
 
                 foreach ($Term in $RecordTerms) {
-
+                    Write-Verbose "TERM $Term"
                     # Redirect modifier
                     if ($Term -match 'redirect=(?<Domain>.+)') {
+                        Write-Verbose '-----REDIRECT-----'
                         $LookupCount++
                         if ($Record -match '(?<Qualifier>[+-~?])all') {
-                            $ValidationFails.Add("FAIL: $Domain - A record with a redirect modifier must not contain an all mechanism, permerror") | Out-Null
+                            $ValidationFails.Add('A record with a redirect modifier must not contain an all mechanism. This will result in a failure.') | Out-Null
                             $Status = 'permerror'
+                            $Recommendations.Add([pscustomobject]@{
+                                    Message = "Remove the 'all' mechanism from this record.";
+                                    Match   = '{0}all' -f $Matches.Qualifier
+                                    Replace = ''
+                                }) | Out-Null
                         }
                         else {
-                            $Domain = $Matches.Domain
-
                             # Follow redirect modifier
-                            $RedirectedLookup = Read-SpfRecord -Domain $Domain -Level 'Redirect'
+                            $RedirectedLookup = Read-SpfRecord -Domain $Matches.Domain -Level 'Redirect'
                             if (($RedirectedLookup | Measure-Object).Count -eq 0) {
-                                $ValidationFails.Add("FAIL: $Domain Redirected lookup does not contain a SPF record, permerror") | Out-Null
+                                $ValidationFails.Add("$Domain Redirected lookup does not contain a SPF record, this will result in a failure.") | Out-Null
                                 $Status = 'permerror'
                             }
                             else {
                                 $RecordList.Add($RedirectedLookup) | Out-Null
                                 $AllMechanism = $RedirectedLookup.AllMechanism
-                                $ValidationFails.AddRange($RedirectedLookup.ValidationFails) | Out-Null
-                                $ValidationWarns.AddRange($RedirectedLookup.ValidationWarns) | Out-Null
-                                $ValidationPasses.AddRange($RedirectedLookup.ValidationPasses) | Out-Null
-                                $IPAddresses.AddRange($RedirectedLookup.IPAddresses) | Out-Null
+                                $ValidationFails.AddRange([string[]]$RedirectedLookup.ValidationFails) | Out-Null
+                                $ValidationWarns.AddRange([string[]]$RedirectedLookup.ValidationWarns) | Out-Null
+                                $ValidationPasses.AddRange([string[]]$RedirectedLookup.ValidationPasses) | Out-Null
+                                $IPAddresses.AddRange([string[]]$RedirectedLookup.IPAddresses) | Out-Null
                             }
                         }
                         # Record has been redirected, stop evaluating terms
@@ -425,25 +569,27 @@ function Read-SpfRecord {
                     }
                  
                     # Explanation modifier
-                    elseif ($Term -match '^exp=(?<Domain>.+)$') {}
+                    elseif ($Term -match '^exp=(?<Domain>.+)$') { Write-Verbose '-----EXP-----' }
             
                     # Include mechanism
                     elseif ($Term -match '^(?<Qualifier>[+-~?])?include:(?<Value>.+)$') {
                         $LookupCount++
-
+                        Write-Verbose '-----INCLUDE-----'
                         Write-Verbose "Looking up include $($Matches.Value)"
                         $IncludeLookup = Read-SpfRecord -Domain $Matches.Value -Level 'Include'
                         
-                        if (($IncludeLookup | Measure-Object).Count -eq 0) {
-                            $ValidationFails.Add("FAIL: $Domain Include lookup does not contain a SPF record, permerror") | Out-Null
+                        if ([string]::IsNullOrEmpty($IncludeLookup.Record) -and $Level -eq 'Parent') {
+                            Write-Verbose '-----END INCLUDE (SPF MISSING)-----'
+                            $ValidationFails.Add("Include lookup for $($Matches.Value) does not contain a SPF record, this will result in a failure.") | Out-Null
                             $Status = 'permerror'
                         }
                         else {
+                            Write-Verbose '-----END INCLUDE (SPF FOUND)-----'
                             $RecordList.Add($IncludeLookup) | Out-Null
-                            $ValidationFails.AddRange($IncludeLookup.ValidationFails) | Out-Null
-                            $ValidationWarns.AddRange($IncludeLookup.ValidationWarns) | Out-Null
-                            $ValidationPasses.AddRange($IncludeLookup.ValidationPasses) | Out-Null
-                            $IPAddresses.AddRange($IncludeLookup.IPAddresses) | Out-Null
+                            $ValidationFails.AddRange([string[]]$IncludeLookup.ValidationFails) | Out-Null
+                            $ValidationWarns.AddRange([string[]]$IncludeLookup.ValidationWarns) | Out-Null
+                            $ValidationPasses.AddRange([string[]]$IncludeLookup.ValidationPasses) | Out-Null
+                            $IPAddresses.AddRange([string[]]$IncludeLookup.IPAddresses) | Out-Null
                         }
                     }
 
@@ -454,7 +600,7 @@ function Read-SpfRecord {
 
                     # ip4/ip6 mechanism
                     elseif ($Term -match '^(?<Qualifier>[+-~?])?ip[4,6]:(?<Value>.+)$') {
-                        if ($Matches.PSObject.Properties.Name -notcontains 'Qualifier' -or $Matches.Qualifier -eq '+') {
+                        if (-not ($Matches.Qualifier) -or $Matches.Qualifier -eq '+') {
                             $IPAddresses.Add($Matches.Value) | Out-Null
                         }
                     }
@@ -489,14 +635,14 @@ function Read-SpfRecord {
                                         }
                                         
                                         if ($MxCount -gt 10) {
-                                            $ValidationWarns.Add("WARN: $Domain - Mechanism 'mx' lookup for $MxDomain exceeded the 10 lookup limit (RFC 7208, Section 4.6.4") | Out-Null
+                                            $ValidationWarns.Add("$Domain - Mechanism 'mx' lookup for $MxDomain has exceeded the 10 lookup limit(RFC 7208, Section 4.6.4).") | Out-Null
                                             $TypeResult = $null
                                             break
                                         }
                                     }
                                 }
                                 elseif ($Matches.RecordType -eq 'ptr') {
-                                    $ValidationWarns.Add("WARN: $Domain - The mechanism 'ptr' should not be published in an SPF record (RFC 7208, Section 5.5)")
+                                    $ValidationWarns.Add("$Domain - The mechanism 'ptr' should not be published in an SPF record (RFC 7208, Section 5.5)")
                                 }
                             }
                             catch {
@@ -504,13 +650,13 @@ function Read-SpfRecord {
                             }
 
                             if ($null -eq $TypeResult -or $TypeResult.Status -ne 0) {
-                                $Message = "$Domain - Type lookup for mechanism '$($TypeQuery.RecordType)' did not return any results"
+                                $Message = "$Domain - Type lookup for the mechanism '$($TypeQuery.RecordType)' did not return any results."
                                 switch ($Level) {
                                     'Parent' { 
-                                        $ValidationFails.Add("FAIL: $Message") | Out-Null
+                                        $ValidationFails.Add("$Message") | Out-Null
                                         $Status = 'permerror'
                                     }
-                                    'Include' { $ValidationWarns.Add("WARN: $Message") | Out-Null }
+                                    'Include' { $ValidationWarns.Add("$Message") | Out-Null }
                                 }
                                 $Result = $false
                             }
@@ -535,26 +681,46 @@ function Read-SpfRecord {
 
                         }
                         else {
-                            $ValidationWarns.Add("WARN: No domain specified and mechanism '$Term' does not have one defined. Specify a domain to perform a lookup on this record.") | Out-Null
+                            $ValidationWarns.Add("No domain was specified and mechanism '$Term' does not have one defined. Specify a domain to perform a lookup on this record.") | Out-Null
                         }
                     
                     }
                     elseif ($null -ne $Term) {
-                        $ValidationWarns.Add("WARN: $Domain - Unknown term specified '$Term'") | Out-Null
+                        $ValidationWarns.Add("$Domain - Unknown term specified '$Term'") | Out-Null
                     }
                 }
             }
         }
     }
-    catch {}
-
+    catch {
+        Write-Verbose "EXCEPTION: $($_.Exception.Message)"
+    }
+    
     # Lookup MX record for expected include information if not supplied
     if ($Level -eq 'Parent' -and $ExpectedInclude -eq '') {
         try {
+            #Write-Information $Domain
             $MXRecord = Read-MXRecord -Domain $Domain
-            $SPFResults.MailProvider = $MXRecord.MailProvider
+            $SpfResults.MailProvider = $MXRecord.MailProvider
             if ($MXRecord.ExpectedInclude -ne '') {
                 $ExpectedInclude = $MXRecord.ExpectedInclude
+            }
+
+            if ($MXRecord.MailProvider.Name -eq 'Null') {
+                if ($Record -eq 'v=spf1 -all') {
+                    $ValidationPasses.Add('This SPF record is valid for a Null MX configuration') | Out-Null
+                }
+                else {
+                    $ValidationFails.Add('This SPF record is not valid for a Null MX configuration. Expected record: "v=spf1 -all"') | Out-Null
+                }
+            }
+
+            if ($TypeLookups.RecordType -contains 'mx') {
+                $Recommendations.Add([pscustomobject]@{
+                        Message = "Remove the 'mx' modifier from your record. Check the mail provider documentation for the correct SPF include.";
+                        Match   = '\s*([+-~?]?mx)\s+'
+                        Replace = ' '
+                    }) | Out-Null
             }
         }
         catch {}
@@ -567,68 +733,107 @@ function Read-SpfRecord {
             $ExpectedIPCount = $ExpectedIncludeSpf.IPAddresses | Measure-Object | Select-Object -ExpandProperty Count
             $FoundIPCount = Compare-Object $IPAddresses $ExpectedIncludeSpf.IPAddresses -IncludeEqual | Where-Object -Property SideIndicator -EQ '==' | Measure-Object | Select-Object -ExpandProperty Count
             if ($ExpectedIPCount -eq $FoundIPCount) {
-                $ValidationPasses.Add("PASS: Expected SPF ($ExpectedInclude) IP addresses were found") | Out-Null
+                $ValidationPasses.Add('The expected mail provider IP address ranges were found.') | Out-Null
             }
             else {
-                $ValidationFails.Add("FAIL: Expected SPF include of '$ExpectedInclude' was not found in the SPF record") | Out-Null
+                $ValidationFails.Add('The expected mail provider entry was not found in the record.') | Out-Null
+                $Recommendations.Add([pscustomobject]@{
+                        Message = ("Add 'include:{0} to your record." -f $ExpectedInclude)
+                        Match   = '^v=spf1 (.+?)([-~?+]all)?$'
+                        Replace = "v=spf1 include:$ExpectedInclude `$1 `$2"
+                    }) | Out-Null
             }
         }
         else {
-            $ValidationPasses.Add("PASS: Expected SPF record ($ExpectedInclude) was included") | Out-Null
+            $ValidationPasses.Add('The expected mail provider entry is part of the record.') | Out-Null
         }
     }
 
     # Count total lookups
     $LookupCount = $LookupCount + ($RecordList | Measure-Object -Property LookupCount -Sum).Sum
-        
+
     if ($Domain -ne 'Not Specified') {
         # Check legacy SPF type
         $LegacySpfType = Resolve-DnsHttpsQuery -Domain $Domain -RecordType 'SPF'
         if ($null -ne $LegacySpfType -and $LegacySpfType -eq 0) {
-            $ValidationWarns.Add("WARN: Domain: $Domain Record Type SPF detected, this is legacy and should not be used. It is recommeded to delete this record. (RFC 7208 Section 14.1)") | Out-Null
+            $ValidationWarns.Add("The record type 'SPF' was detected, this is legacy and should not be used. It is recommeded to delete this record (RFC 7208 Section 14.1).") | Out-Null
         }
     }
     if ($Level -eq 'Parent' -and $RecordCount -gt 0) {
-        # Check for the correct number of records
-        if ($RecordCount -gt 1) {
-            $ValidationFails.Add("FAIL: There should only be one SPF record, $RecordCount detected") | Out-Null 
+        # Check for the correct all mechanism
+        if ($AllMechanism -eq '' -and $Record -ne '') { 
+            $ValidationFails.Add("The 'all' mechanism is missing from SPF record, the default is a neutral qualifier (?all).") | Out-Null
+            $AllMechanism = '?all' 
+        }
+
+        if ($AllMechanism -eq '-all') {
+            $ValidationPasses.Add('The SPF record ends with a hard fail qualifier (-all). This is best practice and will instruct recipients to discard unauthorized senders.') | Out-Null
+        }
+        elseif ($Record -ne '') {
+            $ValidationFails.Add('The SPF record should end in -all to prevent spamming.') | Out-Null 
+            $Recommendations.Add([PSCustomObject]@{
+                    Message = "Replace '{0}' with '-all' to make a SPF failure result in a hard fail." -f $AllMechanism
+                    Match   = [regex]::escape($AllMechanism)
+                    Replace = '-all'
+                }) | Out-Null
+        }
+
+        # SPF lookup count
+        if ($LookupCount -ge 9) {
+            $SpecificLookupsFound = $false
+            foreach ($SpfRecord in $RecordList) {
+                if ($SpfRecord.LookupCount -ge 5) {
+                    $SpecificLookupsFound = $true
+                    $IncludeLookupCount = $SpfRecord.LookupCount + 1
+                    $Match = ('[+-~?]?include:{0}' -f $SpfRecord.Domain)
+                    $Recommendations.Add([PSCustomObject]@{
+                            Message = ("Remove the include modifier for domain '{0}', this adds {1} lookups towards the max of 10. Alternatively, reduce the number of lookups inside this record if you are able to." -f $SpfRecord.Domain, $IncludeLookupCount)
+                            Match   = $Match
+                            Replace = ''
+                        }) | Out-Null
+                } 
+            }
+            if (!($SpecificLookupsFound)) {
+                $Recommendations.Add([PSCustomObject]@{
+                        Message = 'Review include modifiers to ensure that your lookup count stays below 10.'
+                        Match   = ''
+                    }) | Out-Null
+            }
+        }
+
+        if ($LookupCount -gt 10) { 
+            $ValidationFails.Add("Lookup count: $LookupCount/10. The SPF evaluation will fail with a permanent error (RFC 7208 Section 4.6.4).") | Out-Null 
             $Status = 'permerror'
+        }
+        elseif ($LookupCount -ge 9 -and $LookupCount -le 10) {
+            $ValidationWarns.Add("Lookup count: $LookupCount/10. Excessive lookups can cause the SPF evaluation to fail (RFC 7208 Section 4.6.4).") | Out-Null            
+        }
+        else {
+            $ValidationPasses.Add("Lookup count: $LookupCount/10.") | Out-Null
         }
 
         # Report pass if no PermErrors are found
         if ($Status -ne 'permerror') {
-            $ValidationPasses.Add('PASS: No PermError detected in SPF record') | Out-Null
+            $ValidationPasses.Add('No permanent errors detected in the SPF record.') | Out-Null
         }
-
-        # Check for the correct all mechanism
-        if ($AllMechanism -eq '' -and $Record -ne '') { 
-            $ValidationFails.Add('FAIL: All mechanism is missing from SPF record, defaulting to ?all') | Out-Null
-            $AllMechanism = '?all' 
-        }
-        if ($AllMechanism -eq '-all') {
-            $ValidationPasses.Add('PASS: SPF record ends in -all') | Out-Null
-        }
-        elseif ($Record -ne '') {
-            $ValidationFails.Add('FAIL: SPF record should end in -all to prevent spamming') | Out-Null 
-        }
-
-        # SPF lookup count
-        if ($LookupCount -gt 10) { 
-            $ValidationFails.Add("FAIL: Lookup count: $LookupCount/10. SPF evaluation will fail with a permerror (RFC 7208 Section 4.6.4)") | Out-Null 
-            $Status = 'permerror'
-        }
-        elseif ($LookupCount -ge 9 -and $LookupCount -le 10) {
-            $ValidationWarns.Add("WARN: Lookup count: $LookupCount/10. Excessive lookups can cause the SPF evaluation to fail (RFC 7208 Section 4.6.4)") | Out-Null
-        }
-        else {
-            $ValidationPasses.Add("PASS: Lookup count: $LookupCount/10") | Out-Null
-        }
-
 
         # Report pass if no errors are found
         if (($ValidationFails | Measure-Object | Select-Object -ExpandProperty Count) -eq 0) {
-            $ValidationPasses.Add('PASS: All validation succeeded. No errors detected with SPF record') | Out-Null
+            $ValidationPasses.Add('All validation checks passed.') | Out-Null
         }
+    }
+
+    # Check recommendations for replacement regexes
+    if (($Recommendations | Measure-Object).Count -gt 0) {
+        $RecommendedRecord = $Record
+        foreach ($Rec in $Recommendations) {
+            if ($Rec.Match -ne '') {
+                # Replace item in record with recommended
+                $RecommendedRecord = $RecommendedRecord -replace $Rec.Match, $Rec.Replace
+            }
+        }
+        # Cleanup extra spaces
+        $RecommendedRecord = $RecommendedRecord -replace '\s+', ' '
     }
 
     # Set SPF result object
@@ -636,14 +841,19 @@ function Read-SpfRecord {
     $SpfResults.RecordCount = $RecordCount
     $SpfResults.LookupCount = $LookupCount
     $SpfResults.AllMechanism = $AllMechanism
-    $SpfResults.ValidationPasses = $ValidationPasses
-    $SpfResults.ValidationWarns = $ValidationWarns
-    $SpfResults.ValidationFails = $ValidationFails
-    $SpfResults.RecordList = $RecordList
-    $SPFResults.TypeLookups = $TypeLookups
-    $SPFResults.IPAddresses = $IPAddresses
-    $SPFResults.Status = $Status    
+    $SpfResults.ValidationPasses = @($ValidationPasses)
+    $SpfResults.ValidationWarns = @($ValidationWarns)
+    $SpfResults.ValidationFails = @($ValidationFails)
+    $SpfResults.RecordList = @($RecordList)
+    $SpfResults.Recommendations = @($Recommendations)
+    $SpfResults.RecommendedRecord = $RecommendedRecord
+    $SpfResults.TypeLookups = @($TypeLookups)
+    $SpfResults.IPAddresses = @($IPAddresses)
+    $SpfResults.Status = $Status    
 
+    
+    Write-Verbose "-----END SPF RECORD ($Level)-----"
+    
     # Output SpfResults object
     $SpfResults
 }
@@ -675,8 +885,8 @@ function Read-DmarcPolicy {
     ReportingEmails  : {mailauth-reports@google.com}
     ForensicEmails   : {}
     FailureReport    : 0
-    ValidationPasses : {PASS: Aggregate reports are being sent}
-    ValidationWarns  : {FAIL: Policy is not being enforced, WARN: Subdomain policy is only partially enforced with quarantine, WARN: Failure report option 0 will only generate a report on both SPF and DKIM misalignment. It is recommended to set this value to 1}
+    ValidationPasses : {Aggregate reports are being sent}
+    ValidationWarns  : {Policy is not being enforced, Subdomain policy is only partially enforced with quarantine, Failure report option 0 will only generate a report on both SPF and DKIM misalignment. It is recommended to set this value to 1}
     ValidationFails  : {}
     
     #>
@@ -698,21 +908,21 @@ function Read-DmarcPolicy {
         SpfAlignment     = 'r'
         ReportFormat     = 'afrf'
         ReportInterval   = 86400
-        ReportingEmails  = New-Object System.Collections.Generic.List[string]
-        ForensicEmails   = New-Object System.Collections.Generic.List[string]
+        ReportingEmails  = [System.Collections.Generic.List[string]]::new()
+        ForensicEmails   = [System.Collections.Generic.List[string]]::new()
         FailureReport    = ''
-        ValidationPasses = New-Object System.Collections.Generic.List[string]
-        ValidationWarns  = New-Object System.Collections.Generic.List[string]
-        ValidationFails  = New-Object System.Collections.Generic.List[string]
+        ValidationPasses = [System.Collections.Generic.List[string]]::new()
+        ValidationWarns  = [System.Collections.Generic.List[string]]::new()
+        ValidationFails  = [System.Collections.Generic.List[string]]::new()
     }
 
     # Validation lists
-    $ValidationPasses = New-Object System.Collections.Generic.List[string]
-    $ValidationWarns = New-Object System.Collections.Generic.List[string]
-    $ValidationFails = New-Object System.Collections.Generic.List[string]
+    $ValidationPasses = [System.Collections.Generic.List[string]]::new()
+    $ValidationWarns = [System.Collections.Generic.List[string]]::new()
+    $ValidationFails = [System.Collections.Generic.List[string]]::new()
 
     # Email report domains
-    $ReportDomains = New-Object System.Collections.Generic.List[string]
+    $ReportDomains = [System.Collections.Generic.List[string]]::new()
 
     # Validation ranges
     $PolicyValues = @('none', 'quarantine', 'reject')
@@ -727,23 +937,30 @@ function Read-DmarcPolicy {
     }
     
     # Resolve DMARC record
+
     $Query = Resolve-DnsHttpsQuery @DnsQuery
-    if (($null -ne $Query -and $Query.Status -ne 0) -or $null -eq $Query.Answer.data) {
-        if ($Query.Status -eq 3) {
-            $ValidationFails.Add('FAIL: Record does not exist (NXDOMAIN)') | Out-Null
-        }
-        else {
-            $ValidationFails.Add("FAIL: $Domain does not have a DMARC record") | Out-Null
-        }
-    }
-    else {
-        $DmarcRecord = ($Query.Answer | Where-Object -Property type -EQ 16).data
+
+    $RecordCount = 0
+    $Query.Answer | Where-Object { $_.data -match '^v=DMARC1' } | ForEach-Object {
+        $DmarcRecord = $_.data
         $DmarcAnalysis.Record = $DmarcRecord
-        $RecordCount = ($DmarcRecord | Measure-Object).Count   
+        $RecordCount++  
+    }
+    if ($Query.Status -eq 2 -and $Query.AD -eq $false) {
+        $ValidationFails.Add('DNSSEC validation failed.') | Out-Null
+    }
+    elseif ($Query.Status -ne 0 -or $RecordCount -eq 0) {
+        $ValidationFails.Add('This domain does not have a DMARC record.') | Out-Null
+    }
+    elseif (($Query.Answer | Measure-Object).Count -eq 1 -and $RecordCount -eq 0) {
+        $ValidationFails.Add("The record must begin with 'v=DMARC1'.") | Out-Null 
+    }
+    elseif ($RecordCount -gt 1) {
+        $ValidationFails.Add('This domain has multiple records. The policy evaluation will fail.') | Out-Null
     }
 
     # Split DMARC record into name/value pairs
-    $TagList = New-Object System.Collections.Generic.List[PSCustomObject]
+    $TagList = [System.Collections.Generic.List[object]]::new()
     Foreach ($Element in ($DmarcRecord -split ';').trim()) {
         $Name, $Value = $Element -split '='
         $TagList.Add(
@@ -760,8 +977,6 @@ function Read-DmarcPolicy {
         switch ($Tag.Name) {
             'v' {
                 # REQUIRED: Version
-                if ($x -ne 0) { $ValidationFails.Add('FAIL: v=DMARC1 must be at the beginning of the record') | Out-Null }
-                if ($Tag.Value -ne 'DMARC1') { $ValidationFails.Add("FAIL: Version must be DMARC1 - found $($Tag.Value)") | Out-Null }
                 $DmarcAnalysis.Version = $Tag.Value
             }
             'p' {
@@ -777,10 +992,10 @@ function Read-DmarcPolicy {
                 $ReportingEmails = $Tag.Value -split ', '
                 $ReportEmailsSet = $false
                 foreach ($MailTo in $ReportingEmails) {
-                    if ($MailTo -notmatch '^mailto:') { $ValidationFails.Add("FAIL: Aggregate report email must begin with 'mailto:', multiple addresses must be separated by commas - found $($Tag.Value)") | Out-Null }
+                    if ($MailTo -notmatch '^mailto:') { $ValidationFails.Add("Aggregate report email addresses must begin with 'mailto:', multiple addresses must be separated by commas.") | Out-Null }
                     else {
                         $ReportEmailsSet = $true
-                        if ($MailTo -match '^mailto:(?<Email>.+@(?<Domain>.+))$') {
+                        if ($MailTo -match '^mailto:(?<Email>.+@(?<Domain>[^!]+?))(?:!(?<SizeLimit>[0-9]+[kmgt]?))?$') {
                             if ($ReportDomains -notcontains $Matches.Domain -and $Matches.Domain -ne $Domain) {
                                 $ReportDomains.Add($Matches.Domain) | Out-Null
                             }
@@ -789,18 +1004,18 @@ function Read-DmarcPolicy {
                     }
                 }
                 if ($ReportEmailsSet) {
-                    $ValidationPasses.Add('PASS: Aggregate reports are being sent') | Out-Null
+                    $ValidationPasses.Add('Aggregate reports are being sent.') | Out-Null
                 }
                 else {
-                    $ValidationWarns.Add('WARN: Aggregate reports are not being sent') | Out-Null
+                    $ValidationWarns.Add('Aggregate reports are not being sent.') | Out-Null
                 }
             }
             'ruf' {
                 # Forensic reporting emails
                 foreach ($MailTo in ($Tag.Value -split ', ')) {
-                    if ($MailTo -notmatch '^mailto:') { $ValidationFails.Add("FAIL: Forensic report email must begin with 'mailto:', multiple addresses must be separated by commas - found $($Tag.Value)") | Out-Null }
+                    if ($MailTo -notmatch '^mailto:') { $ValidationFails.Add("Forensic report email must begin with 'mailto:', multiple addresses must be separated by commas - found $($Tag.Value)") | Out-Null }
                     else {
-                        if ($MailTo -match '^mailto:(?<Email>.+@(?<Domain>.+))$') {
+                        if ($MailTo -match '^mailto:(?<Email>.+@(?<Domain>[^!]+?))(?:!(?<SizeLimit>[0-9]+[kmgt]?))?$') {
                             if ($ReportDomains -notcontains $Matches.Domain -and $Matches.Domain -ne $Domain) {
                                 $ReportDomains.Add($Matches.Domain) | Out-Null
                             }
@@ -815,7 +1030,7 @@ function Read-DmarcPolicy {
             } 
             'pct' {
                 # Percentage of email to check
-                $DmarcAnalysis.Percent = $Tag.Value
+                $DmarcAnalysis.Percent = [int]$Tag.Value
             }
             'adkim' {
                 # DKIM Alignmenet
@@ -848,64 +1063,60 @@ function Read-DmarcPolicy {
                 $ReportDmarcQuery = Resolve-DnsHttpsQuery @DnsQuery
                 $ReportDmarcRecord = $ReportDmarcQuery.Answer.data
                 if ($null -eq $ReportDmarcQuery -or $ReportDmarcQuery.Status -ne 0) {
-                    $ValidationWarns.Add("WARN: Report DMARC policy for $Domain is missing from $ReportDomain, reports will not be delivered. Expected record: $Domain._report._dmarc.$ReportDomain - Expected value: v=DMARC1; ") | Out-Null
+                    $ValidationWarns.Add("Report DMARC policy for $Domain is missing from $ReportDomain, reports will not be delivered. Expected record: '$Domain._report._dmarc.$ReportDomain' - Expected value: 'v=DMARC1;'") | Out-Null
                     $ReportDomainsPass = $false
                 }
                 elseif ($ReportDmarcRecord -notmatch '^v=DMARC1') {
-                    $ValidationWarns.Add("WARN: Report DMARC policy for $Domain is missing from $ReportDomain, reports will not be delivered. Expected record: $Domain._report._dmarc.$ReportDomain - Expected value: v=DMARC1; ") | Out-Null
+                    $ValidationWarns.Add("Report DMARC policy for $Domain is missing from $ReportDomain, reports will not be delivered. Expected record: '$Domain._report._dmarc.$ReportDomain' - Expected value: 'v=DMARC1;'.") | Out-Null
                     $ReportDomainsPass = $false
                 }
             }
 
             if ($ReportDomainsPass) {
-                $ValidationPasses.Add("PASS: All external reporting domains ($($ReportDomains -join ', ')) allow $Domain to send DMARC reports") | Out-Null
+                $ValidationPasses.Add('All external reporting domains allow this domain to send DMARC reports.') | Out-Null
             }
 
         }
         # Check for missing record tags and set defaults
-        if ($DmarcAnalysis.Policy -eq '') { $ValidationFails.Add('FAIL: Policy record is missing') | Out-Null }
+        if ($DmarcAnalysis.Policy -eq '') { $ValidationFails.Add('The policy tag (p=) is missing from this record. Set this to none, quarantine or reject.') | Out-Null }
         if ($DmarcAnalysis.SubdomainPolicy -eq '') { $DmarcAnalysis.SubdomainPolicy = $DmarcAnalysis.Policy }
 
         # Check policy for errors and best practice
-        if ($PolicyValues -notcontains $DmarcAnalysis.Policy) { $ValidationFails.Add("FAIL: Policy must be one of the following - none, quarantine, reject. Found $($Tag.Value)") | Out-Null }
-        if ($DmarcAnalysis.Policy -eq 'reject') { $ValidationPasses.Add('PASS: Policy is sufficiently strict') | Out-Null }
-        if ($DmarcAnalysis.Policy -eq 'quarantine') { $ValidationWarns.Add('WARN: Policy is only partially enforced with quarantine') | Out-Null }
-        if ($DmarcAnalysis.Policy -eq 'none') { $ValidationWarns.Add('FAIL: Policy is not being enforced') | Out-Null }
+        if ($PolicyValues -notcontains $DmarcAnalysis.Policy) { $ValidationFails.Add("The policy must be one of the following: none, quarantine or reject. Found $($Tag.Value)") | Out-Null }
+        if ($DmarcAnalysis.Policy -eq 'reject') { $ValidationPasses.Add('The domain policy is set to reject, this is best practice.') | Out-Null }
+        if ($DmarcAnalysis.Policy -eq 'quarantine') { $ValidationWarns.Add('The domain policy is only partially enforced with quarantine. Set this to reject to be fully compliant.') | Out-Null }
+        if ($DmarcAnalysis.Policy -eq 'none') { $ValidationFails.Add('The domain policy is not being enforced.') | Out-Null }
 
         # Check subdomain policy
-        if ($PolicyValues -notcontains $DmarcAnalysis.SubdomainPolicy) { $ValidationFails.Add("FAIL: Subdomain policy must be one of the following - none, quarantine, reject. Found $($DmarcAnalysis.SubdomainPolicy)") | Out-Null }
-        if ($DmarcAnalysis.SubdomainPolicy -eq 'reject') { $ValidationPasses.Add('PASS: Subdomain policy is sufficiently strict') | Out-Null }
-        if ($DmarcAnalysis.SubdomainPolicy -eq 'quarantine') { $ValidationWarns.Add('WARN: Subdomain policy is only partially enforced with quarantine') | Out-Null }
-        if ($DmarcAnalysis.SubdomainPolicy -eq 'none') { $ValidationWarns.Add('FAIL: Subdomain policy is not being enforced') | Out-Null }
+        if ($PolicyValues -notcontains $DmarcAnalysis.SubdomainPolicy) { $ValidationFails.Add("The subdomain policy must be one of the following: none, quarantine or reject. Found $($DmarcAnalysis.SubdomainPolicy)") | Out-Null }
+        if ($DmarcAnalysis.SubdomainPolicy -eq 'reject') { $ValidationPasses.Add('The subdomain policy is set to reject, this is best practice.') | Out-Null }
+        if ($DmarcAnalysis.SubdomainPolicy -eq 'quarantine') { $ValidationWarns.Add('The subdomain policy is only partially enforced with quarantine. Set this to reject to be fully compliant.') | Out-Null }
+        if ($DmarcAnalysis.SubdomainPolicy -eq 'none') { $ValidationFails.Add('The subdomain policy is not being enforced.') | Out-Null }
 
         # Check percentage - validate range and ensure 100%
-        if ($DmarcAnalysis.Percent -lt 100 -and $DmarcAnalysis.Percent -gt 0) { $ValidationWarns.Add('WARN: Not all emails will be processed by the DMARC policy') | Out-Null }
-        if ($DmarcAnalysis.Percent -gt 100 -or $DmarcAnalysis.Percent -le 0) { $ValidationFails.Add('FAIL: Percentage must be between 1 and 100') | Out-Null }
+        if ($DmarcAnalysis.Percent -lt 100 -and $DmarcAnalysis.Percent -ge 0) { $ValidationWarns.Add('Not all emails will be processed by the DMARC policy.') | Out-Null }
+        if ($DmarcAnalysis.Percent -gt 100 -or $DmarcAnalysis.Percent -lt 0) { $ValidationFails.Add('The percentage tag (pct=) must be between 0 and 100.') | Out-Null }
 
         # Check report format
-        if ($ReportFormatValues -notcontains $DmarcAnalysis.ReportFormat) { $ValidationFails.Add("FAIL: The report format '$($DmarcAnalysis.ReportFormat)' is not supported") | Out-Null }
+        if ($ReportFormatValues -notcontains $DmarcAnalysis.ReportFormat) { $ValidationFails.Add("The report format '$($DmarcAnalysis.ReportFormat)' is not supported.") | Out-Null }
  
         # Check forensic reports and failure options
         $ForensicCount = ($DmarcAnalysis.ForensicEmails | Measure-Object | Select-Object -ExpandProperty Count)
-        if ($ForensicCount -eq 0 -and $DmarcAnalysis.FailureReport -ne '') { $ValidationWarns.Add('WARN: Forensic email reports recipients are not defined and failure report options are set. No reports will be sent.') | Out-Null }
+        if ($ForensicCount -eq 0 -and $DmarcAnalysis.FailureReport -ne '') { $ValidationWarns.Add('Forensic email reports recipients are not defined and failure report options are set. No reports will be sent. This is not an issue unless you are expecting forensic reports.') | Out-Null }
         if ($DmarcAnalysis.FailureReport -eq '' -and $null -ne $DmarcRecord) { $DmarcAnalysis.FailureReport = '0' }
         if ($ForensicCount -gt 0) {
-            if ($FailureReportValues -notcontains $DmarcAnalysis.FailureReport) { $ValidationFails.Add('FAIL: Failure reporting options must be 0, 1, d or s') | Out-Null }
-            if ($DmarcAnalysis.FailureReport -eq '1') { $ValidationPasses.Add('PASS: Failure report option 1 generates forensic reports on SPF or DKIM misalignment') | Out-Null }
-            if ($DmarcAnalysis.FailureReport -eq '0') { $ValidationWarns.Add('WARN: Failure report option 0 will only generate a forensic report on both SPF and DKIM misalignment. It is recommended to set this value to 1') | Out-Null }
-            if ($DmarcAnalysis.FailureReport -eq 'd') { $ValidationWarns.Add('WARN: Failure report option d will only generate a forensic report on failed DKIM evaluation. It is recommended to set this value to 1') | Out-Null }
-            if ($DmarcAnalysis.FailureReport -eq 's') { $ValidationWarns.Add('WARN: Failure report option s will only generate a forensic report on failed SPF evaluation. It is recommended to set this value to 1') | Out-Null }
+            if ($FailureReportValues -notcontains $DmarcAnalysis.FailureReport) { $ValidationFails.Add('Failure reporting options must be 0, 1, d or s.') | Out-Null }
+            if ($DmarcAnalysis.FailureReport -eq '1') { $ValidationPasses.Add('Failure report option 1 generates forensic reports on SPF or DKIM misalignment.') | Out-Null }
+            if ($DmarcAnalysis.FailureReport -eq '0') { $ValidationWarns.Add('Failure report option 0 will only generate a forensic report on both SPF and DKIM misalignment. It is recommended to set this value to 1.') | Out-Null }
+            if ($DmarcAnalysis.FailureReport -eq 'd') { $ValidationWarns.Add('Failure report option d will only generate a forensic report on failed DKIM evaluation. It is recommended to set this value to 1.') | Out-Null }
+            if ($DmarcAnalysis.FailureReport -eq 's') { $ValidationWarns.Add('Failure report option s will only generate a forensic report on failed SPF evaluation. It is recommended to set this value to 1.') | Out-Null }
         }
-    }
-    
-    if ($RecordCount -gt 1) {
-        $ValidationWarns.Add('WARN: Multiple DMARC records detected, this may cause unexpected behavior.') | Out-Null
     }
 
     # Add the validation lists
-    $DmarcAnalysis.ValidationPasses = $ValidationPasses
-    $DmarcAnalysis.ValidationWarns = $ValidationWarns
-    $DmarcAnalysis.ValidationFails = $ValidationFails
+    $DmarcAnalysis.ValidationPasses = @($ValidationPasses)
+    $DmarcAnalysis.ValidationWarns = @($ValidationWarns)
+    $DmarcAnalysis.ValidationFails = @($ValidationFails)
 
     # Return DMARC analysis
     $DmarcAnalysis
@@ -938,40 +1149,64 @@ function Read-DkimRecord {
         [string]$Domain,
 
         [Parameter()]
-        [string[]]$Selectors = @()
+        [System.Collections.Generic.List[string]]$Selectors = @()
     )
 
     $MXRecord = $null
+    $MinimumSelectorPass = 0
+    $SelectorPasses = 0
 
     $DkimAnalysis = [PSCustomObject]@{
         Domain           = $Domain
+        Selectors        = $Selectors
         MailProvider     = ''
-        Records          = New-Object System.Collections.Generic.List[PSCustomObject]
-        ValidationPasses = New-Object System.Collections.Generic.List[string]
-        ValidationWarns  = New-Object System.Collections.Generic.List[string]
-        ValidationFails  = New-Object System.Collections.Generic.List[string]
+        Records          = [System.Collections.Generic.List[object]]::new()
+        ValidationPasses = [System.Collections.Generic.List[string]]::new()
+        ValidationWarns  = [System.Collections.Generic.List[string]]::new()
+        ValidationFails  = [System.Collections.Generic.List[string]]::new()
     }
 
-    $ValidationPasses = New-Object System.Collections.Generic.List[string]
-    $ValidationWarns = New-Object System.Collections.Generic.List[string]
-    $ValidationFails = New-Object System.Collections.Generic.List[string]
+    $ValidationPasses = [System.Collections.Generic.List[string]]::new()
+    $ValidationWarns = [System.Collections.Generic.List[string]]::new()
+    $ValidationFails = [System.Collections.Generic.List[string]]::new()
 
     if (($Selectors | Measure-Object | Select-Object -ExpandProperty Count) -eq 0) {
+        # MX lookup, check for defined selectors
         try {
-            $MXRecord = Read-MXRecord -Domain $Domain 
-            $Selectors = $MXRecord.Selectors
+            $MXRecord = Read-MXRecord -Domain $Domain
+            foreach ($Selector in $MXRecord.Selectors) {
+                $Selectors.Add($Selector) | Out-Null
+            }
             $DkimAnalysis.MailProvider = $MXRecord.MailProvider
+            if ($MXRecord.MailProvider.PSObject.Properties.Name -contains 'MinimumSelectorPass') {
+                $MinimumSelectorPass = $MXRecord.MailProvider.MinimumSelectorPass
+            }
+            $DkimAnalysis.Selectors = $Selectors
         }
         catch {}
-        if (($Selectors | Measure-Object | Select-Object -ExpandProperty Count) -eq 0) {
-            $ValidationFails.Add("FAIL: $Domain - No selectors found from MX record") | Out-Null
+        
+        # Explicitly defined DKIM selectors
+        if (Test-Path 'Config\DkimSelectors') {
+            try {
+                Get-ChildItem 'Config\DkimSelectors' -Filter "$($Domain).json" -ErrorAction Stop | ForEach-Object {
+                    try {
+                        $CustomSelectors = Get-Content $_ | ConvertFrom-Json
+                        foreach ($Selector in $CustomSelectors) {
+                            $Selectors.Add($Selector) | Out-Null
+                        }
+                    } 
+                    catch {}
+                }
+            }
+            catch {}
         }
     }
     
-    if (($Selectors | Measure-Object | Select-Object -ExpandProperty Count) -gt 0 -and $Selectors -notcontains '') {
+    if (($Selectors | Measure-Object | Select-Object -ExpandProperty Count) -gt 0) {
         foreach ($Selector in $Selectors) {
             # Initialize object
             $DkimRecord = [PSCustomObject]@{
+                Selector         = ''
                 Record           = ''
                 Version          = ''
                 PublicKey        = ''
@@ -982,7 +1217,7 @@ function Read-DkimRecord {
                 HashAlgorithms   = ''
                 ServiceType      = ''
                 Granularity      = ''
-                UnrecognizedTags = New-Object System.Collections.Generic.List[PSCustomObject]
+                UnrecognizedTags = [System.Collections.Generic.List[object]]::new()
             }
 
             $DnsQuery = @{
@@ -992,17 +1227,24 @@ function Read-DkimRecord {
 
             $QueryResults = Resolve-DnsHttpsQuery @DnsQuery
 
+            if ([string]::IsNullOrEmpty($Selector)) { continue }
+            
+            if ($QueryResults.Status -eq 2 -and $QueryResults.AD -eq $false) {
+                $ValidationFails.Add('DNSSEC validation failed.') | Out-Null
+            }
             if ($QueryResults -eq '' -or $QueryResults.Status -ne 0) {
                 if ($QueryResults.Status -eq 3) {
-                    $ValidationFails.Add("FAIL: $Selector - Selector record does not exist (NXDOMAIN)") | Out-Null
+                    if ($MinimumSelectorPass -eq 0) {
+                        $ValidationFails.Add("$Selector - The selector record does not exist for this domain.") | Out-Null
+                    }
                 }
                 else {
-                    $ValidationFails.Add("FAIL: $Selector - DKIM record is missing, check the selector and try again") | Out-Null
+                    $ValidationFails.Add("$Selector - DKIM record is missing, check the selector and try again") | Out-Null
                 }
                 $Record = ''
             }
             else {
-                $QueryData = ($QueryResults.Answer).data
+                $QueryData = ($QueryResults.Answer).data | Where-Object { $_ -match '(v=|k=|t=|p=)' }
                 if (( $QueryData | Measure-Object).Count -gt 1) {
                     $Record = $QueryData[-1]
                 }
@@ -1010,13 +1252,16 @@ function Read-DkimRecord {
                     $Record = $QueryData
                 }
             }
+            $DkimRecord.Selector = $Selector
+
+            if ($null -eq $Record) { $Record = '' }
             $DkimRecord.Record = $Record
 
             # Split DKIM record into name/value pairs
-            $TagList = New-Object System.Collections.Generic.List[PSCustomObject]
-            Foreach ($Element in ($Record -split ';').trim()) {
+            $TagList = [System.Collections.Generic.List[object]]::new()
+            Foreach ($Element in ($Record -split ';')) {
                 if ($Element -ne '') {
-                    $Name, $Value = $Element -split '='
+                    $Name, $Value = $Element.trim() -split '='
                     $TagList.Add(
                         [PSCustomObject]@{
                             Name  = $Name
@@ -1026,15 +1271,15 @@ function Read-DkimRecord {
                 }
             }
             
-
             # Loop through name/value pairs and set object properties
             $x = 0
-            foreach ($Tag in $TagList) {
+            foreach ($Tag in $TagList) { 
+                if ($x -eq 0 -and $Tag.Value -ne 'DKIM1') { $ValidationFails.Add("$Selector - The record must being with 'v=DKIM1'.") | Out-Null }
+            
                 switch ($Tag.Name) {
                     'v' {
                         # REQUIRED: Version
-                        if ($x -ne 0) { $ValidationFails.Add("FAIL: $Selector - v=DKIM1 must be at the beginning of the record") | Out-Null }
-                        if ($Tag.Value -ne 'DKIM1') { $ValidationFails.Add("FAIL: $Selector - Version must be DKIM1 - found $($Tag.Value)") | Out-Null }
+                        if ($x -ne 0) { $ValidationFails.Add("$Selector - The record must being with 'v=DKIM1'.") | Out-Null }
                         $DkimRecord.Version = $Tag.Value
                     }
                     'p' {
@@ -1044,7 +1289,12 @@ function Read-DkimRecord {
                             $DkimRecord.PublicKeyInfo = Get-RsaPublicKeyInfo -EncodedString $Tag.Value
                         }
                         else {
-                            $ValidationFails.Add("FAIL: $Selector - No public key specified for DKIM record") | Out-Null 
+                            if ($MXRecord.MailProvider.Name -eq 'Null') {
+                                $ValidationPasses.Add("$Selector - DKIM configuration is valid for a Null MX record configuration.") | Out-Null
+                            }
+                            else {
+                                $ValidationFails.Add("$Selector - There is no public key specified for this DKIM record or the key is revoked.") | Out-Null 
+                            }
                         }
                     }
                     'k' {
@@ -1080,41 +1330,219 @@ function Read-DkimRecord {
                 $UnrecognizedTagCount = $UnrecognizedTags | Measure-Object | Select-Object -ExpandProperty Count
                 if ($UnrecognizedTagCount -gt 0) {
                     $TagString = ($UnrecognizedTags | ForEach-Object { '{0}={1}' -f $_.Tag, $_.Value }) -join ', '
-                    $ValidationWarns.Add("WARN: $Selector - $UnrecognizedTagCount tag(s) detected in DKIM record. This can cause issues with some mailbox providers. Tags: $TagString")
+                    $ValidationWarns.Add("$Selector - $UnrecognizedTagCount urecognized tag(s) were detected in the DKIM record. This can cause issues with some mailbox providers. Tags: $TagString")
                 }
                 if ($DkimRecord.Flags -eq 'y') {
-                    $ValidationWarns.Add("WARN: $Selector - This flag 't=y' indicates that this domain is testing mode currently. If DKIM is fully deployed, this flag should be changed to t=s unless subdomaining is required.") | Out-Null
+                    $ValidationWarns.Add("$Selector - The flag 't=y' indicates that this domain is testing mode currently. If DKIM is fully deployed, this flag should be changed to t=s unless subdomaining is required.") | Out-Null
                 }
 
-                if ($DkimRecord.PublicKeyInfo.SignatureAlgorithm -ne $DkimRecord.KeyType) {
-                    $ValidationWarns.Add("WARN: $Selector - Key signature algorithm $($DkimRecord.PublicKeyInfo.SignatureAlgorithm) does not match $($DkimRecord.KeyType)") | Out-Null
+                if ($DkimRecord.PublicKeyInfo.SignatureAlgorithm -ne $DkimRecord.KeyType -and $MXRecord.MailProvider.Name -ne 'Null') {
+                    $ValidationWarns.Add("$Selector - Key signature algorithm $($DkimRecord.PublicKeyInfo.SignatureAlgorithm) does not match $($DkimRecord.KeyType)") | Out-Null
                 }
 
-                if ($DkimRecord.PublicKeyInfo.KeySize -lt 1024) {
-                    $ValidationFails.Add("FAIL: $Selector - Key size is less than 1024 bit, found $($DkimRecord.PublicKeyInfo.KeySize)") | Out-Null
+                if ($DkimRecord.PublicKeyInfo.KeySize -lt 1024 -and $MXRecord.MailProvider.Name -ne 'Null') {
+                    $ValidationFails.Add("$Selector - Key size is less than 1024 bit, found $($DkimRecord.PublicKeyInfo.KeySize).") | Out-Null
                 }
                 else {
-                    $ValidationPasses.Add("PASS: $Selector - DKIM key validation succeeded ($($DkimRecord.PublicKeyInfo.KeySize) bit)") | Out-Null
+                    if ($MXRecord.MailProvider.Name -ne 'Null') {
+                        $ValidationPasses.Add("$Selector - DKIM key validation succeeded.") | Out-Null
+                    }
+                    $SelectorPasses++
                 }
-                ($DkimAnalysis.Records).Add($DkimRecord) | Out-Null
-            }
 
-            if (($ValidationFails | Measure-Object | Select-Object -ExpandProperty Count) -eq 0) {
-                $ValidationPasses.Add("PASS: $Selector - No errors detected with DKIM record") | Out-Null
-            }
+                if (($ValidationFails | Measure-Object | Select-Object -ExpandProperty Count) -eq 0) {
+                    $ValidationPasses.Add("$Selector - No errors detected with DKIM record.") | Out-Null
+                }
+            }    
+            ($DkimAnalysis.Records).Add($DkimRecord) | Out-Null
         }
     }
-    else {
-        $ValidationFails.Add('FAIL: No DKIM selectors provided') | Out-Null
+    if (($DkimAnalysis.Records | Measure-Object | Select-Object -ExpandProperty Count) -eq 0 -and [string]::IsNullOrEmpty($DkimAnalysis.Selectors)) {
+        $ValidationWarns.Add('No DKIM selectors provided, set them in the domain options.') | Out-Null
+    }
+
+    if ($MinimumSelectorPass -gt 0 -and $SelectorPasses -eq 0) {
+        $ValidationFails.Add(('{0} DKIM record(s) found. The minimum number of valid records ({1}) was not met.' -f $SelectorPasses, $MinimumSelectorPass)) | Out-Null
+    }
+    elseif ($MinimumSelectorPass -gt 0 -and $SelectorPasses -ge $MinimumSelectorPass) {
+        $ValidationPasses.Add(('Minimum number of valid DKIM records were met {0}/{1}.' -f $SelectorPasses, $MinimumSelectorPass))
     }
 
     # Collect validation results
-    $DkimAnalysis.ValidationPasses = $ValidationPasses
-    $DkimAnalysis.ValidationWarns = $ValidationWarns
-    $DkimAnalysis.ValidationFails = $ValidationFails
+    $DkimAnalysis.ValidationPasses = @($ValidationPasses)
+    $DkimAnalysis.ValidationWarns = @($ValidationWarns)
+    $DkimAnalysis.ValidationFails = @($ValidationFails)
 
     # Return analysis
     $DkimAnalysis
+}
+
+function Read-WhoisRecord {
+    <#
+    .SYNOPSIS
+    Reads Whois record data for queried information
+    
+    .DESCRIPTION
+    Connects to top level registrar servers (IANA, ARIN) and performs recursion to find Whois data
+    
+    .PARAMETER Query
+    Whois query to perform (e.g. microsoft.com)
+    
+    .PARAMETER Server
+    Whois server to query, defaults to whois.iana.org
+    
+    .PARAMETER Port
+    Whois server port, default 43
+    
+    .EXAMPLE
+    PS> Read-WhoisRecord -Query microsoft.com
+    
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter (Position = 0, Mandatory = $true)]
+        [String]$Query,
+        [String]$Server = 'whois.iana.org',
+        $Port = 43
+    )
+    $HasReferral = $false
+
+    # Top level referring servers, IANA, ARIN and AUDA
+    $TopLevelReferrers = @('whois.iana.org', 'whois.arin.net', 'whois.auda.org.au')
+
+    # Record Pattern Matching
+    $ServerPortRegex = '(?<refsvr>[^:\r\n]+)(:(?<port>\d+))?'
+    $ReferralMatch = @{
+        'ReferralServer'         = "whois://$ServerPortRegex"
+        'Whois Server'           = $ServerPortRegex
+        'Registrar Whois Server' = $ServerPortRegex
+        'refer'                  = $ServerPortRegex
+        'remarks'                = '(?<refsvr>whois\.[0-9a-z\-\.]+\.[a-z]{2,})(:(?<port>\d+))?'
+    }
+
+    # List of properties for Registrars
+    $RegistrarProps = @(
+        'Registrar', 'Registrar Name'
+    )
+
+    # Whois parser, generic Property: Value format with some multi-line support and comment handlers
+    $WhoisRegex = '^(?!(?:%|>>>|-+|#|[*]))[^\S\n]*(?<PropName>.+?):(?:[\r\n]+)?(:?(?!([0-9]|[/]{2}))[^\S\r\n]*(?<PropValue>.+))?$'
+
+    # TCP Client for Whois
+    $Client = New-Object System.Net.Sockets.TcpClient($Server, 43)
+    try {
+        # Open TCP connection and send query
+        $Stream = $Client.GetStream()
+        $ReferralServers = [System.Collections.Generic.List[string]]::new()
+        $ReferralServers.Add($Server) | Out-Null
+
+        # WHOIS query to send
+        $Data = [System.Text.Encoding]::Ascii.GetBytes("$Query`r`n")
+        $Stream.Write($Data, 0, $data.length)
+
+        # Read response from stream
+        $Reader = New-Object System.IO.StreamReader $Stream, [System.Text.Encoding]::ASCII
+        $Raw = $Reader.ReadToEnd()
+        
+        # Split comments and parse raw whois results
+        $data, $comment = $Raw -split '(>>>|\n\s+--)'
+        $PropMatches = [regex]::Matches($data, $WhoisRegex, ([System.Text.RegularExpressions.RegexOptions]::MultiLine, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase))
+
+        # Hold property count in hashtable for auto increment
+        $PropertyCounts = @{}
+
+        # Create ordered list for properties
+        $Results = [ordered]@{}
+        foreach ($PropMatch in $PropMatches) { 
+            $PropName = $PropMatch.Groups['PropName'].value
+            if ($Results.Contains($PropName)) {
+                $PropertyCounts.$PropName++
+                $PropName = '{0}{1}' -f $PropName, $PropertyCounts.$PropName
+                $Results[$PropName] = $PropMatch.Groups['PropValue'].value.trim()
+            }
+            else {
+                $Results[$PropName] = $PropMatch.Groups['PropValue'].value.trim()
+                $PropertyCounts.$PropName = 0
+            }
+        }
+
+        foreach ($RegistrarProp in $RegistrarProps) {
+            if ($Results.Contains($RegistrarProp)) {
+                $Results._Registrar = $Results.$RegistrarProp
+                if($Results.$RegistrarProp -eq 'Registrar') {
+                    break  # Means we always favour Registrar if it exists, or keep looking
+                }
+            }
+        }
+
+        # Store raw results and query metadata
+        $Results._Raw = $Raw
+        $Results._ReferralServers = [System.Collections.Generic.List[string]]::new()
+        $Results._Query = $Query
+        $LastResult = $Results
+
+        # Loop through keys looking for referral server match
+        foreach ($Key in $ReferralMatch.Keys) {
+            if ([bool]($Results.Keys -match $Key)) {
+                if ($Results.$Key -match $ReferralMatch.$Key) {
+                    $ReferralServer = $Matches.refsvr
+                    if ($Server -ne $ReferralServer) {
+                        if ($Matches.port) { $Port = $Matches.port }
+                        else { $Port = 43 }
+                        $HasReferral = $true
+                        break
+                    }
+                }
+            }
+        }
+
+        # Recurse through referrals
+        if ($HasReferral) {    
+            if ($Server -ne $ReferralServer) {
+                $LastResult = $Results
+                $Results = Read-WhoisRecord -Query $Query -Server $ReferralServer -Port $Port
+                if ($Results._Raw -Match '(No match|Not Found|No Data|The queried object does not exist)' -and $TopLevelReferrers -notcontains $Server) { 
+                    $Results = $LastResult 
+                }
+                else {
+                    foreach ($s in $Results._ReferralServers) {
+                        $ReferralServers.Add($s) | Out-Null
+                    }
+                }
+                
+            }
+        } 
+        else {
+            if ($Results._Raw -Match '(No match|Not Found|No Data)') {
+                $first, $newquery = ($Query -split '\.')
+                if (($newquery | Measure-Object).Count -gt 1) {
+                    $Query = $newquery -join '.'
+                    $Results = Read-WhoisRecord -Query $Query -Server $Server -Port $Port
+                    foreach ($s in $Results._ReferralServers) {
+                        $ReferralServers.Add($s) | Out-Null
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        Write-Error $_.Exception.Message
+    }
+    finally {
+        IF ($Stream) {
+            $Stream.Close()
+            $Stream.Dispose()
+        }
+    }
+
+    # Collect referral server list
+    $Results._ReferralServers = $ReferralServers
+    
+    # Convert to json and back to preserve object order
+    $WhoisResults = $Results | ConvertTo-Json | ConvertFrom-Json
+
+    # Return Whois results as PSObject
+    $WhoisResults
 }
 
 function Get-RsaPublicKeyInfo {
@@ -1277,4 +1705,700 @@ namespace SevenTiny.Bantina.Security {
 
     # Return RSA Public Key information
     [SevenTiny.Bantina.Security.RSACommon]::CreateRsaProviderFromPublicKey($EncodedString)
+}
+
+function Test-HttpsCertificate {
+    <#
+    .SYNOPSIS
+    Test HTTPS certificate for Domain
+    
+    .DESCRIPTION
+    This function aggregates test results for a domain and subdomains in regards to
+    HTTPS certificates
+    
+    .PARAMETER Domain
+    Domain to check
+    
+    .PARAMETER Subdomains
+    List of subdomains
+    
+    .EXAMPLE
+    PS> Test-HttpsCertificate -Domain badssl.com -Subdomains expired, revoked
+
+    #>
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true)]
+        [string]$Domain,
+        [string[]]$Subdomains = @()
+    )
+    
+    $CertificateTests = [PSCustomObject]@{
+        Domain           = $Domain
+        UrlsToTest       = [System.Collections.Generic.List[string]]::new()
+        Tests            = [System.Collections.Generic.List[object]]::new()
+        ValidationPasses = [System.Collections.Generic.List[string]]::new()
+        ValidationWarns  = [System.Collections.Generic.List[string]]::new()
+        ValidationFails  = [System.Collections.Generic.List[string]]::new()
+    }
+
+    $Urls = [System.Collections.Generic.List[string]]::new()
+    $Urls.Add(('https://{0}' -f $Domain)) | Out-Null
+
+    if (($Subdomains | Measure-Object).Count -gt 0) {
+        foreach ($Subdomain in $Subdomains) {
+            $Urls.Add(('https://{0}.{1}' -f $Subdomain, $Domain)) | Out-Null
+        }
+    }
+    
+    $CertificateTests.UrlsToTest = $Urls
+
+    $CertificateTests.Tests = foreach ($Url in $Urls) {
+        $Test = [PSCustomObject]@{
+            Hostname         = ''
+            Certificate      = ''
+            Chain            = ''
+            HttpResponse     = ''
+            ValidityDays     = 0
+            ValidationPasses = [System.Collections.Generic.List[string]]::new()
+            ValidationWarns  = [System.Collections.Generic.List[string]]::new()
+            ValidationFails  = [System.Collections.Generic.List[string]]::new()
+            Errors           = [System.Collections.Generic.List[string]]::new()
+        }      
+        try {
+            # Parse URL and extract hostname
+            $ParsedUrl = [System.Uri]::new($Url)
+            $Hostname = $ParsedUrl.Host
+
+            # Valdiations
+            $ValidationPasses = [System.Collections.Generic.List[string]]::new()
+            $ValidationWarns = [System.Collections.Generic.List[string]]::new()
+            $ValidationFails = [System.Collections.Generic.List[string]]::new()
+
+            # Grab certificate data
+            $Validation = Get-ServerCertificateValidation -Url $Url
+            $Certificate = $Validation.Certificate | Select-Object FriendlyName, IssuerName, NotBefore, NotAfter, SerialNumber, SignatureAlgorithm, SubjectName, Thumbprint, Issuer, Subject, DnsNameList
+            $HttpResponse = $Validation.HttpResponse
+            $Chain = $Validation.Chain
+
+            $CurrentDate = Get-Date
+            $TimeSpan = New-TimeSpan -Start $CurrentDate -End $Certificate.NotAfter
+
+            # Check to see if certificate is contained in the DNS name list
+            if ($Certificate.DnsNameList -contains $Hostname -or $Certificate.DnsNameList -eq "*.$Domain") {
+                $ValidationPasses.Add(('{0} - Certificate DNS name list contains hostname.' -f $Hostname)) | Out-Null
+            }
+            else {
+                $ValidationFails.Add(('{0} - Certificate DNS name list does not contain hostname' -f $Hostname)) | Out-Null
+            }
+
+            # Check certificate validity
+            if ($Certificate.NotBefore -ge $CurrentDate) {
+                # NotBefore is in the future
+                $ValidationFails.Add(('{0} - Certificate is not yet valid.' -f $Hostname)) | Out-Null
+            }
+            elseif ($Certificate.NotAfter -le $CurrentDate) {
+                # NotAfter is in the past
+                $ValidationFails.Add(('{0} - Certificate expired {1} day(s) ago.' -f $Hostname, [Math]::Abs($TimeSpan.Days))) | Out-Null
+            }
+            elseif ($Certificate.NotAfter -ge $CurrentDate -and $TimeSpan.Days -lt 30) {
+                # NotAfter is under 30 days away
+                $ValidationWarns.Add(('{0} - Certificate will expire in {1} day(s).' -f $Hostname, $TimeSpan.Days)) | Out-Null
+            }
+            else {
+                # Certificate is valid and not expired
+                $ValidationPasses.Add(('{0} - Certificate is valid for the next {1} days.' -f $Hostname, $TimeSpan.Days)) | Out-Null
+            }
+
+            # Certificate chain errors
+            if (($Chain.ChainStatus | Measure-Object).Count -gt 0) {
+                foreach ($Status in $Chain.ChainStatus) {
+                    $ValidationFails.Add(('{0} - {1}' -f $Hostname, $Status.StatusInformation)) | Out-Null
+                }
+            }
+
+            # Website status errorr
+            if ([int]$HttpResponse.StatusCode -ge 400) {
+                $ValidationFails.Add(('{0} - Website responded with: {1}' -f $Hostname, $HttpResponse.ReasonPhrase))
+            } 
+
+            # Set values and return Test object
+            $Test.Hostname = $Hostname
+            $Test.Certificate = $Certificate
+            $Test.Chain = $Chain
+            $Test.HttpResponse = $HttpResponse
+            $Test.ValidityDays = $TimeSpan.Days
+
+            $Test.ValidationPasses = @($ValidationPasses)
+            $Test.ValidationWarns = @($ValidationWarns)
+            $Test.ValidationFails = @($ValidationFails)
+
+            # Return test
+            $Test
+        }
+        catch {}
+    }
+
+    # Aggregate validation results
+    foreach ($Test in $CertificateTests.Tests) {
+        $ValidationPassCount = ($Test.ValidationPasses | Measure-Object).Count
+        $ValidationWarnCount = ($Test.ValidationWarns | Measure-Object).Count
+        $ValidationFailCount = ($Test.ValidationFails | Measure-Object).Count
+
+        if ($ValidationFailCount -gt 0) {
+            $CertificateTests.ValidationFails.Add(('{0} - Failure on {1} check(s)' -f $Test.Hostname, $ValidationFailCount)) | Out-Null
+        }
+        
+        if ($ValidationWarnCount -gt 0) {
+            $CertificateTests.ValidationWarns.Add(('{0} - Warning on {1} check(s)' -f $Test.Hostname, $ValidationWarnCount)) | Out-Null
+        }
+
+        if ($ValidationPassCount -gt 0) {
+            $CertificateTests.ValidationPasses.Add(('{0} - Pass on {1} check(s)' -f $Test.Hostname, $ValidationPassCount)) | Out-Null
+        }
+    }
+    
+    # Return tests
+    $CertificateTests
+}
+
+
+function Get-ServerCertificateValidation {
+    <#
+    .SYNOPSIS
+    Get HTTPS certificate and chain information for Url
+    
+    .DESCRIPTION
+    Obtains certificate data from .Net HttpClient and builds certificate chain to
+    verify validity and revocation status
+    
+    .PARAMETER Url
+    Url to check
+    
+    .PARAMETER FollowRedirect
+    Follow HTTP redirects
+    
+    .EXAMPLE
+    PS> Get-ServerCertificateValidation -Url https://expired.badssl.com
+    
+    #>
+    Param(
+        [Parameter(Mandatory = $true)]
+        $Url,
+        [switch]$FollowRedirect
+    )
+    $source = @'
+using System;
+using System.Net.Http;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+using System.Threading.Tasks;
+
+namespace CyberDrain.CIPP {
+
+    public class CertValidation {
+        public HttpResponseMessage HttpResponse;
+        public X509Certificate2 Certificate;
+        public X509Chain Chain;
+        public SslPolicyErrors SslErrors;
+    }
+
+    public static class CertificateCheck {
+        public static CertValidation GetServerCertificate(string url, bool allowredirect=false)
+        {
+            CertValidation certvalidation = new CertValidation();
+            var httpClientHandler = new HttpClientHandler
+            {
+                AllowAutoRedirect = allowredirect,
+                ServerCertificateCustomValidationCallback = (requestMessage, cert, chain, sslErrors) =>
+                {
+                    X509Chain ch = new X509Chain();
+                    ch.ChainPolicy.RevocationFlag = X509RevocationFlag.EntireChain;
+                    ch.ChainPolicy.RevocationMode = X509RevocationMode.Online;
+                    ch.ChainPolicy.VerificationFlags = X509VerificationFlags.AllFlags;
+                    //ch.ChainPolicy.DisableCertificateDownloads = true;
+                    certvalidation.Certificate = new X509Certificate2(cert.GetRawCertData());
+                    ch.Build(cert);
+                    certvalidation.Chain = ch;
+                    certvalidation.SslErrors = sslErrors;
+                    return true;
+                }
+            };
+
+            var httpClient = new HttpClient(httpClientHandler);
+            HttpResponseMessage HttpResponse = Task.Run(async() => await httpClient.SendAsync(new HttpRequestMessage(HttpMethod.Get, url))).Result;
+            certvalidation.HttpResponse = HttpResponse;
+            return certvalidation;
+        }
+    }
+}
+'@
+    if (!('CyberDrain.CIPP.CertificateCheck' -as [type])) {
+        Add-Type -TypeDefinition $source -Language CSharp
+    }
+
+    [CyberDrain.CIPP.CertificateCheck]::GetServerCertificate($Url, $FollowRedirect)
+}
+
+function Test-MtaSts {
+    <#
+    .SYNOPSIS
+    Perform MTA-STS and TLSRPT checks
+    
+    .DESCRIPTION
+    Retrieve MTA-STS record, policy and TLSRPT record
+    
+    .PARAMETER Domain
+    Domain to process
+    
+    .EXAMPLE
+    PS> Test-MtaSts -Domain gmail.com
+
+    #>
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true)]
+        [string]$Domain
+    )
+
+    # MTA-STS test object
+    $MtaSts = [PSCustomObject]@{
+        Domain           = $Domain
+        StsRecord        = (Read-MtaStsRecord -Domain $Domain)
+        StsPolicy        = (Read-MtaStsPolicy -Domain $Domain)
+        TlsRptRecord     = (Read-TlsRptRecord -Domain $Domain)
+        ValidationPasses = [System.Collections.Generic.List[string]]::new()
+        ValidationWarns  = [System.Collections.Generic.List[string]]::new()
+        ValidationFails  = [System.Collections.Generic.List[string]]::new()
+    }
+
+    # Validation lists
+    $ValidationPasses = [System.Collections.Generic.List[string]]::new()
+    $ValidationWarns = [System.Collections.Generic.List[string]]::new()
+    $ValidationFails = [System.Collections.Generic.List[string]]::new()
+
+    # Check results for each test
+    if ($MtaSts.StsRecord.IsValid) { $ValidationPasses.Add('MTA-STS Record is valid') | Out-Null }
+    else { $ValidationFails.Add('MTA-STS Record is not valid') | Out-Null }
+    if ($MtaSts.StsRecord.HasWarnings) { $ValidationWarns.Add('MTA-STS Record has warnings') | Out-Null }
+
+    if ($MtaSts.StsPolicy.IsValid) { $ValidationPasses.Add('MTA-STS Policy is valid') | Out-Null }
+    else { $ValidationFails.Add('MTA-STS Policy is not valid') | Out-Null }
+    if ($MtaSts.StsPolicy.HasWarnings) { $ValidationWarns.Add('MTA-STS Policy has warnings') | Out-Null }
+
+    if ($MtaSts.TlsRptRecord.IsValid) { $ValidationPasses.Add('TLSRPT Record is valid') | Out-Null }
+    else { $ValidationFails.Add('TLSRPT Record is not valid') | Out-Null }
+    if ($MtaSts.TlsRptRecord.HasWarnings) { $ValidationWarns.Add('TLSRPT Record has warnings') | Out-Null }
+
+    # Aggregate validation results
+    $MtaSts.ValidationPasses = $ValidationPasses
+    $MtaSts.ValidationWarns = $ValidationWarns
+    $MtaSts.ValidationFails = $ValidationFails
+
+    $MtaSts
+}
+
+function Read-MtaStsRecord {
+    <#
+    .SYNOPSIS
+    Resolve and validate MTA-STS record
+    
+    .DESCRIPTION
+    Query domain for DMARC policy (_mta-sts.domain.com) and parse results. Record is checked for issues.
+    
+    .PARAMETER Domain
+    Domain to process MTA-STS record
+    
+    .EXAMPLE
+    PS> Read-MtaStsRecord -Domain gmail.com
+
+    #>
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true)]
+        [string]$Domain
+    )
+
+    # Initialize object
+    $StsAnalysis = [PSCustomObject]@{
+        Domain           = $Domain
+        Record           = ''
+        Version          = ''
+        Id               = ''
+        IsValid          = $false
+        HasWarnings      = $false
+        ValidationPasses = [System.Collections.Generic.List[string]]::new()
+        ValidationWarns  = [System.Collections.Generic.List[string]]::new()
+        ValidationFails  = [System.Collections.Generic.List[string]]::new()
+    }
+
+    # Validation lists
+    $ValidationPasses = [System.Collections.Generic.List[string]]::new()
+    $ValidationWarns = [System.Collections.Generic.List[string]]::new()
+    $ValidationFails = [System.Collections.Generic.List[string]]::new()
+
+    # Validation ranges
+
+    $RecordCount = 0
+
+    $DnsQuery = @{
+        RecordType = 'TXT'
+        Domain     = "_mta-sts.$Domain"
+    }
+    
+    # Resolve DMARC record
+
+    $Query = Resolve-DnsHttpsQuery @DnsQuery
+
+    $RecordCount = 0
+    $Query.Answer | Where-Object { $_.data -match '^v=STSv1' } | ForEach-Object {
+        $StsRecord = $_.data
+        $StsAnalysis.Record = $StsRecord
+        $RecordCount++  
+    }
+    if ($Query.Status -eq 2 -and $Query.AD -eq $false) {
+        $ValidationFails.Add('DNSSEC validation failed.') | Out-Null
+    }
+    elseif ($Query.Status -ne 0 -or $RecordCount -eq 0) {
+        if ($Query.Status -eq 3) {
+            $ValidationFails.Add('Record does not exist (NXDOMAIN)') | Out-Null
+        }
+        else {
+            $ValidationFails.Add("$Domain does not have an MTA-STS record") | Out-Null
+        }
+    }
+    elseif ($RecordCount -gt 1) {
+        $ValidationFails.Add("$Domain has multiple MTA-STS records") | Out-Null
+    }
+
+    # Split DMARC record into name/value pairs
+    $TagList = [System.Collections.Generic.List[object]]::new()
+    Foreach ($Element in ($StsRecord -split ';').trim()) {
+        $Name, $Value = $Element -split '='
+        $TagList.Add(
+            [PSCustomObject]@{
+                Name  = $Name
+                Value = $Value
+            }
+        ) | Out-Null
+    }
+
+    # Loop through name/value pairs and set object properties
+    $x = 0
+    foreach ($Tag in $TagList) {
+        switch ($Tag.Name) {
+            'v' {
+                # REQUIRED: Version
+                if ($x -ne 0) { $ValidationFails.Add('v=STSv1 must be at the beginning of the record') | Out-Null }
+                if ($Tag.Value -ne 'STSv1') { $ValidationFails.Add("Version must be STSv1 - found $($Tag.Value)") | Out-Null }
+                $StsAnalysis.Version = $Tag.Value
+            }
+            'id' {
+                # REQUIRED: Id
+                $StsAnalysis.Id = $Tag.Value
+            }
+
+        }
+        $x++
+    }
+
+    if ($RecordCount -gt 0) {
+        # Check for missing record tags and set defaults
+        if ($StsAnalysis.Id -eq '') { $ValidationFails.Add('Id record is missing') | Out-Null }
+        elseif ($StsAnalysis.Id -notmatch '^[A-Za-z0-9]+$') {
+            $ValidationFails.Add('STS Record ID must be alphanumeric') | Out-Null 
+        }
+            
+        if ($RecordCount -gt 1) {
+            $ValidationWarns.Add('Multiple MTA-STS records detected, this may cause unexpected behavior.') | Out-Null
+            $StsAnalysis.HasWarnings = $true
+        }
+        
+        $ValidationWarnCount = ($Test.ValidationWarns | Measure-Object).Count
+        $ValidationFailCount = ($Test.ValidationFails | Measure-Object).Count
+        if ($ValidationFailCount -eq 0 -and $ValidationWarnCount -eq 0) {
+            $ValidationPasses.Add('MTA-STS record is valid') | Out-Null
+            $StsAnalysis.IsValid = $true
+        }
+    }
+
+    # Add the validation lists
+    $StsAnalysis.ValidationPasses = @($ValidationPasses)
+    $StsAnalysis.ValidationWarns = @($ValidationWarns)
+    $StsAnalysis.ValidationFails = @($ValidationFails)
+
+    # Return MTA-STS analysis
+    $StsAnalysis
+}
+
+function Read-MtaStsPolicy {
+    <#
+    .SYNOPSIS
+    Resolve and validate MTA-STS policy
+    
+    .DESCRIPTION
+    Retrieve mta-sts.txt from .well-known directory on domain
+    
+    .PARAMETER Domain
+    Domain to process MTA-STS policy 
+    
+    .EXAMPLE
+    PS> Read-MtaStsPolicy -Domain gmail.com
+    #>   
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true)]
+        [string]$Domain
+    )
+
+    $StsPolicyAnalysis = [PSCustomObject]@{
+        Domain           = $Domain
+        Version          = ''
+        Mode             = ''
+        Mx               = [System.Collections.Generic.List[string]]::new()
+        MaxAge           = ''
+        IsValid          = $false
+        HasWarnings      = $false
+        ValidationPasses = [System.Collections.Generic.List[string]]::new()
+        ValidationWarns  = [System.Collections.Generic.List[string]]::new()
+        ValidationFails  = [System.Collections.Generic.List[string]]::new()
+    }
+
+    $ValidationPasses = [System.Collections.Generic.List[string]]::new()
+    $ValidationWarns = [System.Collections.Generic.List[string]]::new()
+    $ValidationFails = [System.Collections.Generic.List[string]]::new()
+
+    # Valid policy modes
+    $StsPolicyModes = @('testing', 'enforce')
+
+    # Request policy file from domain, only accept text/plain results
+    $RequestParams = @{
+        Uri     = ('https://mta-sts.{0}/.well-known/mta-sts.txt' -f $Domain)
+        Headers = @{
+            Accept = 'text/plain'
+        }
+    }
+
+    $PolicyExists = $false
+    try {
+        $wr = Invoke-WebRequest @RequestParams -ErrorAction Stop
+        $PolicyExists = $true
+    }
+    catch {
+        $ValidationFails.Add(('MTA-STS policy does not exist for {0}' -f $Domain)) | Out-Null
+    }
+
+    # Policy file is key value pairs split on new lines
+    $StsPolicyEntries = [System.Collections.Generic.List[object]]::new()
+    $Entries = $wr.Content -split "`r?`n"
+    foreach ($Entry in $Entries) {
+        if ($null -ne $Entry) {
+            try {
+                $Name, $Value = $Entry -split ':'
+                $StsPolicyEntries.Add(
+                    [PSCustomObject]@{
+                        Name  = $Name.trim()
+                        Value = $Value.trim()
+                    }
+                ) | Out-Null
+            }
+            catch {}
+        }
+    }
+
+    foreach ($StsPolicyEntry in $StsPolicyEntries) {
+        switch ($StsPolicyEntry.Name) {
+            'version' {
+                # REQUIRED: Version
+                $StsPolicyAnalysis.Version = $StsPolicyEntry.Value
+            }
+            'mode' {
+                $StsPolicyAnalysis.Mode = $StsPolicyEntry.Value
+            }
+            'mx' {
+                $StsPolicyAnalysis.Mx.Add($StsPolicyEntry.Value) | Out-Null
+            }
+            'max_age' {
+                $StsPolicyAnalysis.MaxAge = $StsPolicyEntry.Value
+            }
+        }
+    }
+
+    # Check policy for issues
+    if ($PolicyExists) {
+        if ($StsPolicyAnalysis.Version -ne 'STSv1') { 
+            $ValidationFails.Add("Version must be STSv1 - found $($StsPolicyEntry.Value)") | Out-Null 
+        }
+        if ($StsPolicyAnalysis.Version -eq '') {
+            $ValidationFails.Add('Version is missing from policy') | Out-Null
+        }
+        if ($StsPolicyModes -notcontains $StsPolicyAnalysis.Mode) {
+            $ValidationFails.Add(('Policy mode "{0}" is not valid. (Options: {1})' -f $StsPolicyAnalysis.Mode, $StsPolicyModes -join ', '))
+        }
+        if ($StsPolicyAnalysis.Mode -eq 'Testing') { 
+            $ValidationWarns.Add('MTA-STS policy is in testing mode, no action will be taken') | Out-Null 
+            $StsPolicyAnalysis.HasWarnings = $true
+        }
+
+        $ValidationFailCount = ($ValidationFails | Measure-Object).Count
+        if ($ValidationFailCount -eq 0) {
+            $ValidationPasses.Add('MTA-STS policy is valid')
+            $StsPolicyAnalysis.IsValid = $true
+        }
+    }
+
+    # Aggregate validation results
+    $StsPolicyAnalysis.ValidationPasses = @($ValidationPasses)
+    $StsPolicyAnalysis.ValidationWarns = @($ValidationWarns)
+    $StsPolicyAnalysis.ValidationFails = @($ValidationFails)
+
+    $StsPolicyAnalysis
+}
+
+function Read-TlsRptRecord {
+    <#
+    .SYNOPSIS
+    Resolve and validate TLSRPT record
+    
+    .DESCRIPTION
+    Query domain for TLSRPT record (_smtp._tls.domain.com) and parse results. Record is checked for issues.
+    
+    .PARAMETER Domain
+    Domain to process TLSRPT record
+    
+    .EXAMPLE
+    PS> Read-TlsRptRecord -Domain gmail.com
+
+    #>
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true)]
+        [string]$Domain
+    )
+
+    # Initialize object
+    $TlsRptAnalysis = [PSCustomObject]@{
+        Domain           = $Domain
+        Record           = ''
+        Version          = ''
+        RuaEntries       = [System.Collections.Generic.List[string]]::new()
+        IsValid          = $false
+        HasWarnings      = $false
+        ValidationPasses = [System.Collections.Generic.List[string]]::new()
+        ValidationWarns  = [System.Collections.Generic.List[string]]::new()
+        ValidationFails  = [System.Collections.Generic.List[string]]::new()
+    }
+
+    $ValidRuaProtocols = @(
+        '^(?<Rua>https:.+)$'
+        '^mailto:(?<Rua>.+)$'
+    )
+
+    # Validation lists
+    $ValidationPasses = [System.Collections.Generic.List[string]]::new()
+    $ValidationWarns = [System.Collections.Generic.List[string]]::new()
+    $ValidationFails = [System.Collections.Generic.List[string]]::new()
+
+    # Validation ranges
+
+    $RecordCount = 0
+
+    $DnsQuery = @{
+        RecordType = 'TXT'
+        Domain     = "_smtp._tls.$Domain"
+    }
+    
+    # Resolve DMARC record
+
+    $Query = Resolve-DnsHttpsQuery @DnsQuery
+
+    $RecordCount = 0
+    $Query.Answer | Where-Object { $_.data -match '^v=TLSRPTv1' } | ForEach-Object {
+        $TlsRtpRecord = $_.data
+        $TlsRptAnalysis.Record = $TlsRtpRecord
+        $RecordCount++  
+    }
+    if ($Query.Status -eq 2 -and $Query.AD -eq $false) {
+        $ValidationFails.Add('DNSSEC validation failed.') | Out-Null
+    }
+    if ($Query.Status -ne 0 -or $RecordCount -eq 0) {
+        if ($Query.Status -eq 3) {
+            $ValidationFails.Add('Record does not exist (NXDOMAIN)') | Out-Null
+        }
+        else {
+            $ValidationFails.Add("$Domain does not have an TLSRPT record") | Out-Null
+        }
+    }
+    elseif ($RecordCount -gt 1) {
+        $ValidationFails.Add("$Domain has multiple TLSRPT records") | Out-Null
+    }
+
+    # Split DMARC record into name/value pairs
+    $TagList = [System.Collections.Generic.List[object]]::new()
+    Foreach ($Element in ($TlsRtpRecord -split ';').trim()) {
+        $Name, $Value = $Element -split '='
+        $TagList.Add(
+            [PSCustomObject]@{
+                Name  = $Name
+                Value = $Value
+            }
+        ) | Out-Null
+    }
+
+    # Loop through name/value pairs and set object properties
+    $x = 0
+    foreach ($Tag in $TagList) {
+        switch ($Tag.Name) {
+            'v' {
+                # REQUIRED: Version
+                if ($x -ne 0) { $ValidationFails.Add('v=TLSRPTv1 must be at the beginning of the record') | Out-Null }
+                if ($Tag.Value -ne 'TLSRPTv1') { $ValidationFails.Add("Version must be TLSRPTv1 - found $($Tag.Value)") | Out-Null }
+                $TlsRptAnalysis.Version = $Tag.Value
+            }
+            'rua' {
+                $RuaMatched = $false
+                $RuaEntries = $Tag.Value -split ','
+                foreach ($RuaEntry in $RuaEntries) {
+                    foreach ($Protocol in $ValidRuaProtocols) {
+                        if ($RuaEntry -match $Protocol) {
+                            $TlsRptAnalysis.RuaEntries.Add($Matches.Rua) | Out-Null
+                            $RuaMatched = $true
+                        }
+                    }
+                }
+                if ($RuaMatched) {
+                    $ValidationPasses.Add('Aggregate reports are being sent') | Out-Null
+                }
+                else {
+                    $ValidationWarns.Add('Aggregate reports are not being sent') | Out-Null
+                    $TlsRptAnalysis.HasWarnings = $true
+                }
+            }
+        }
+        $x++
+    }
+
+    if ($RecordCount -gt 0) {
+        # Check for missing record tags and set defaults
+            
+        if ($RecordCount -gt 1) {
+            $ValidationWarns.Add('Multiple TLSRPT records detected, this may cause unexpected behavior.') | Out-Null
+            $TlsRptAnalysis.HasWarnings = $true
+        }
+        
+        $ValidationWarnCount = ($Test.ValidationWarns | Measure-Object).Count
+        $ValidationFailCount = ($Test.ValidationFails | Measure-Object).Count
+        if ($ValidationFailCount -eq 0 -and $ValidationWarnCount -eq 0) {
+            $ValidationPasses.Add('TLSRPT record is valid') | Out-Null
+            $TlsRptAnalysis.IsValid = $true
+        }
+    }
+
+    # Add the validation lists
+    $TlsRptAnalysis.ValidationPasses = $ValidationPasses
+    $TlsRptAnalysis.ValidationWarns = $ValidationWarns
+    $TlsRptAnalysis.ValidationFails = $ValidationFails
+
+    # Return MTA-STS analysis
+    $TlsRptAnalysis
 }

@@ -33,17 +33,14 @@ $Results = foreach ($Tenant in $tenants) {
             IntuneBody      = $intunebody
         } | ConvertTo-Json -Depth 15
         $JSONFile = New-Item -Path ".\ChocoApps.Cache\$(New-Guid)" -Value $CompleteObject -Force -ErrorAction Stop
-        "Succesfully added Choco App for $($Tenant) to queue.<br>"
+        "Succesfully added Choco App for $($Tenant) to queue."
         Log-Request -user $request.headers.'x-ms-client-principal' -API $APINAME -tenant $tenant -message "Chocolatey Application $($intunebody.Displayname) queued to add" -Sev "Info"
     }
     catch {
         Log-Request -user $request.headers.'x-ms-client-principal'  -API $APINAME -tenant $tenant -message "Failed to add Chocolatey Application $($intunebody.Displayname) to queue" -Sev "Error"
-        "Failed added Choco App for $($Tenant) to queue<br>"
+        "Failed added Choco App for $($Tenant) to queue"
     }
 }
-
-$InstanceId = Start-NewOrchestration -FunctionName 'Applications_Orchestrator'
-Write-Host "Started orchestration with ID = '$InstanceId'"
 
 $body = [pscustomobject]@{"Results" = $results }
 
